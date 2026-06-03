@@ -200,12 +200,28 @@ div[data-testid="stTextInput"] input{
 
 # ── Session state & data ──────────────────────────────────────────────────────
 
-def refresh_computed(portfolio_data=None):
-    data = portfolio_data or st.session_state.portfolio
-    st.session_state.computed = compute_portfolio(data)
+def refresh_computed(portfolio_data=None, live_prices=None):
+    data   = portfolio_data or st.session_state.portfolio
+    prices = live_prices or st.session_state.get("live_prices")
+    st.session_state.computed = compute_portfolio(data, prices)
 
+def fetch_and_compute(portfolio_data=None):
+    """Fetch live prices then recompute. Called on load and manual refresh."""
+    data    = portfolio_data or st.session_state.portfolio
+    tickers = [h["ticker"] for h in data["holdings"]]
+    prices  = fetch_prices(tickers)
+    st.session_state.live_prices = prices
+    st.session_state.computed    = compute_portfolio(data, prices)
+
+# Load portfolio data
 if "portfolio" not in st.session_state:
     st.session_state.portfolio = load_portfolio()
+
+# Auto-fetch live prices once per session (not re-triggered by widget reruns)
+if "live_prices" not in st.session_state:
+    with st.spinner("Fetching live prices…"):
+        fetch_and_compute()
+
 if "computed" not in st.session_state:
     refresh_computed()
 
@@ -242,15 +258,20 @@ with h1:
                 "font-weight:400;color:#F1F5F9;margin:0;'>Portfolio Intelligence</h1>",
                 unsafe_allow_html=True)
 with h2:
-    st.markdown(f"<div class='ts' style='padding-top:12px;'>{d['ts']}</div>", unsafe_allow_html=True)
+    price_icon = "🟢" if d.get("any_live") else "🟡"
+    price_note = d.get("price_note", "")
+    st.markdown(
+        f"<div class='ts' style='padding-top:8px;'>{d['ts']}<br>"
+        f"<span style='color:#4B5563;'>{price_icon} {price_note}</span></div>",
+        unsafe_allow_html=True,
+    )
 with h3:
     if st.button("⟳"):
-        with st.spinner("Fetching prices…"):
-            tickers = [h["ticker"] for h in p["holdings"]]
-            live    = fetch_prices(tickers)
-            if live:
-                st.session_state.computed = compute_portfolio(p, live)
-                d = st.session_state.computed
+        with st.spinner("Fetching live prices…"):
+            # Clear cached prices to force a fresh fetch
+            st.session_state.pop("live_prices", None)
+            fetch_and_compute()
+            d = st.session_state.computed
         st.rerun()
 
 st.markdown("<hr class='divider'>", unsafe_allow_html=True)
