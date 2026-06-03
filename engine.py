@@ -516,3 +516,220 @@ def _build_recommendations(cash, positions, wl_items, grand, tech_w):
                              pos["name"], pos["pl_pct"])})
     recs.sort(key=lambda x: x["priority"])
     return recs[:5]
+
+
+# ---------------------------------------------------------------------------
+# CAPITAL ALLOCATION ENGINE
+# ---------------------------------------------------------------------------
+
+def compute_allocation(data, live_prices=None, analysis=None):
+    """
+    Capital Allocation Engine.
+
+    Inputs:
+      data        - portfolio.json dict
+      live_prices - output of fetch_prices()
+      analysis    - output of compute_analysis() (optional, uses scores if present)
+
+    Returns allocation dict with:
+      available_cash, reserve_cash, deployable_cash,
+      overall_mode, concentration_warnings,
+      candidates (ranked list with dollar amounts),
+      sector_headroom (how much more each sector can absorb)
+    """
+
+    holdings   = data["holdings"]
+    cash       = float(data.get("cash", 0))
+    grand      = float(sum(
+        (float(h["shares"]) * ((live_prices or {}).get(h["ticker"], {}) or {}).get("price", float(h["avg_buy"])))
+        for h in holdings if h["status"] == "Owned"
+    ) + cash) or 1.0
+
+    # Rules
+    MAX_POSITION_PCT   = 25.0   # no single position > 25% of total
+    MAX_SECTOR_PCT     = 40.0   # no sector > 40%
+    MIN_CASH_RESERVE   = 0.15   # keep 15% as cash reserve
+
+    reserve_cash    = round(grand * MIN_CASH_RESERVE, 2)
+    deployable_cash = max(0.0, round(cash - reserve_cash, 2))
+
+    # Current sector weights
+    sector_mv = {}
+    pos_weights = {}
+    for h in holdings:
+        if h["status"] != "Owned":
+            continue
+        lp    = (live_prices or {}).get(h["ticker"]) or {}
+        price = lp.get("price") or float(h["avg_buy"])
+        mv    = float(h["shares"]) * price
+        sec   = h["sector"]
+        sector_mv[sec]        = sector_mv.get(sec, 0) + mv
+        pos_weights[h["ticker"]] = round(mv / grand * 100, 2)
+
+    sector_weights = {s: round(v / grand * 100, 2) for s, v in sector_mv.items()}
+
+    # Sector headroom (how much $ more before hitting 40% cap)
+    sector_headroom = {}
+    for sec, w in sector_weights.items():
+        room_pct = max(0.0, MAX_SECTOR_PCT - w)
+        sector_headroom[sec] = round(room_pct / 100 * grand, 2)
+
+    # Concentration warnings
+    warnings = []
+    for ticker, w in pos_weights.items():
+        if w > MAX_POSITION_PCT:
+            warnings.append({
+                "type": "position",
+                "msg":  "%s is %.1f%% of portfolio (max %.0f%%)" % (ticker, w, MAX_POSITION_PCT),
+                "icon": "⚠️",
+            })
+    for sec, w in sector_weights.items():
+        if w > MAX_SECTOR_PCT:
+            warnings.append({
+                "type": "sector",
+                "msg":  "%s sector is %.1f%% of portfolio (max %.0f%%)" % (sec, w, MAX_SECTOR_PCT),
+                "icon": "⚠️",
+            })
+    cash_pct = cash / grand * 100
+    if cash_pct < MIN_CASH_RESERVE * 100:
+        warnings.append({
+            "type": "cash",
+            "msg":  "Cash %.1f%% is below %.0f%% minimum reserve" % (cash_pct, MIN_CASH_RESERVE * 100),
+            "icon": "⚠️",
+        })
+
+    # Build candidate list from all holdings
+    candidates_raw = []
+    an = analysis or {}
+
+    for h in holdings:
+        ticker = h["ticker"]
+        status = h["status"]
+        a      = an.get(ticker, {})
+        if not isinstance(a, dict):
+            continue
+
+        quality  = a.get("quality")
+        risk     = a.get("risk")
+        mos      = a.get("mos")
+        upside   = a.get("upside")
+        rating   = a.get("rating", "Hold")
+
+        # Skip Avoid-rated or ones with no data
+        if rating == "Avoid":
+            continue
+        if quality is None and upside is None:
+            continue
+
+        # Allocation Score (0-100)
+        q_score  = ((quality or 5) / 10) * 40          # 40% weight
+        mos_norm = min(max((mos or 0) + 30, 0), 60)     # map -30..+30 → 0..60
+        m_score  = (mos_norm / 60) * 25                 # 25% weight
+        up_norm  = min(max((upside or 0), 0), 50)       # cap at 50% upside
+        u_score  = (up_norm / 50) * 20                  # 20% weight
+        r_inv    = (10 - (risk or 5)) / 9               # invert risk: low risk = high score
+        r_score  = r_inv * 15                            # 15% weight
+
+        alloc_score = round(q_score + m_score + u_score + r_score, 1)
+
+        # Position headroom: how much more can go into this stock
+        curr_w   = pos_weights.get(ticker, 0.0)
+        room_pct = max(0.0, MAX_POSITION_PCT - curr_w)
+        max_add  = round(room_pct / 100 * grand, 2)
+
+        # Sector headroom
+        sec        = h["sector"]
+        sec_room   = sector_headroom.get(sec, grand * MAX_SECTOR_PCT / 100)
+
+        # Effective max = min of position headroom and sector headroom
+        effective_max = min(max_add, sec_room)
+
+        # Owned positions get priority boost
+        priority_boost = 5 if status == "Owned" else 0
+        # Strong Buy gets extra boost
+        if rating == "Strong Buy": priority_boost += 8
+        elif rating == "Buy":      priority_boost += 4
+
+        final_score = min(100, alloc_score + priority_boost)
+
+        candidates_raw.append({
+            "ticker":       ticker,
+            "name":         h.get("name", ticker),
+            "sector":       sec,
+            "status":       status,
+            "style":        h.get("style", ""),
+            "rating":       rating,
+            "alloc_score":  final_score,
+            "quality":      quality,
+            "risk":         risk,
+            "mos":          mos,
+            "upside":       upside,
+            "current_w":    curr_w,
+            "max_add":      effective_max,
+        })
+
+    # Sort by allocation score descending
+    candidates_raw.sort(key=lambda x: -x["alloc_score"])
+
+    # Distribute deployable cash proportionally (top 5 candidates)
+    top5 = [c for c in candidates_raw if c["max_add"] > 0][:5]
+    total_score = sum(c["alloc_score"] for c in top5) or 1.0
+    cash_left   = deployable_cash
+
+    candidates = []
+    for c in top5:
+        proportion  = c["alloc_score"] / total_score
+        raw_amount  = round(deployable_cash * proportion, -2)   # round to $100
+        amount      = min(raw_amount, c["max_add"], cash_left)
+        amount      = max(0.0, round(amount / 100) * 100)       # snap to $100
+        cash_left   = max(0.0, cash_left - amount)
+        if amount >= 100:
+            candidates.append({**c, "suggested_amount": amount})
+
+    # Overall mode
+    avg_score = sum(c["alloc_score"] for c in candidates_raw[:5]) / max(len(candidates_raw[:5]), 1)
+    n_buys    = sum(1 for c in candidates_raw if c["rating"] in ("Strong Buy", "Buy"))
+
+    if deployable_cash < 1000:
+        mode = "Hold Cash"
+        mode_color = "#6B7280"
+        mode_icon  = "🏦"
+        mode_desc  = "Insufficient deployable cash after reserve. Build cash position first."
+    elif avg_score >= 70 and n_buys >= 2:
+        mode = "Aggressive Buy"
+        mode_color = "#10B981"
+        mode_icon  = "🚀"
+        mode_desc  = "Multiple high-scoring opportunities with strong analyst backing. Deploy capital actively."
+    elif avg_score >= 55 and n_buys >= 1:
+        mode = "Selective Buying"
+        mode_color = "#3B82F6"
+        mode_icon  = "✅"
+        mode_desc  = "Good opportunities exist but be selective. Focus on top 2-3 highest-scored candidates."
+    elif len(warnings) >= 2:
+        mode = "Defensive Mode"
+        mode_color = "#EF4444"
+        mode_icon  = "🛡️"
+        mode_desc  = "Portfolio has concentration risk or low cash. Prioritise rebalancing over new positions."
+    else:
+        mode = "Hold Cash"
+        mode_color = "#F59E0B"
+        mode_icon  = "⏸️"
+        mode_desc  = "No compelling entry points at current prices. Preserve cash and wait for better levels."
+
+    return {
+        "available_cash":         cash,
+        "reserve_cash":           reserve_cash,
+        "deployable_cash":        deployable_cash,
+        "cash_pct":               round(cash_pct, 1),
+        "grand_total":            grand,
+        "overall_mode":           mode,
+        "mode_color":             mode_color,
+        "mode_icon":              mode_icon,
+        "mode_desc":              mode_desc,
+        "concentration_warnings": warnings,
+        "candidates":             candidates,
+        "all_candidates":         candidates_raw,
+        "sector_weights":         sector_weights,
+        "sector_headroom":        sector_headroom,
+        "pos_weights":            pos_weights,
+    }
