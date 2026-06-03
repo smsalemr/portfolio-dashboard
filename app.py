@@ -16,7 +16,8 @@ import plotly.graph_objects as go
 import json, os
 from datetime import datetime, timezone
 from engine import (load_portfolio, save_portfolio, fetch_prices, compute_portfolio,
-                   fetch_analysis, compute_analysis, STYLE_ICONS, RATING_STYLES)
+                   fetch_analysis, compute_analysis, compute_allocation,
+                   STYLE_ICONS, RATING_STYLES)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -288,7 +289,7 @@ with h3:
 st.markdown("<hr class='divider'>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💡 Recs", "✏️ Update"])
+tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💰 Allocation", "💡 Recs", "✏️ Update"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -614,9 +615,179 @@ with tabs[3]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — RECOMMENDATIONS
+# TAB 5 — CAPITAL ALLOCATION
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[4]:
+    analysis  = st.session_state.get("analysis", {})
+    port_data = st.session_state.portfolio
+    alloc     = compute_allocation(
+        port_data,
+        live_prices=st.session_state.get("live_prices"),
+        analysis=analysis,
+    )
+
+    # ── Overall Mode Banner ───────────────────────────────────────────────────
+    st.markdown(
+        "<div style='background:%s;border-radius:14px;padding:1rem 1.4rem;"
+        "margin-bottom:1rem;display:flex;align-items:center;gap:1rem;'>"
+        "<span style='font-size:2rem;'>%s</span>"
+        "<div><div style='font-family:DM Mono,monospace;font-size:0.65rem;"
+        "letter-spacing:.18em;text-transform:uppercase;color:#94A3B8;'>Overall Recommendation</div>"
+        "<div style='font-family:DM Serif Display,serif;font-size:1.5rem;color:#F1F5F9;'>%s</div>"
+        "<div style='font-family:DM Sans,sans-serif;font-size:0.82rem;color:#94A3B8;margin-top:3px;'>%s</div>"
+        "</div></div>" % (
+            alloc["mode_color"] + "22",
+            alloc["mode_icon"],
+            alloc["overall_mode"],
+            alloc["mode_desc"],
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # ── Cash Summary ──────────────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Cash Position</div>", unsafe_allow_html=True)
+    ac1, ac2, ac3, ac4 = st.columns(4)
+    ac1.metric("Available Cash",      fmt_usd(alloc["available_cash"], 0),
+               "%.1f%% of portfolio" % alloc["cash_pct"])
+    ac2.metric("Reserve (15%)",       fmt_usd(alloc["reserve_cash"], 0),
+               "Minimum to keep")
+    ac3.metric("Deployable Today",    fmt_usd(alloc["deployable_cash"], 0),
+               "After reserve")
+    n_ops = sum(1 for c in alloc["candidates"] if c["suggested_amount"] > 0)
+    ac4.metric("Opportunities Found", str(n_ops))
+
+    # ── Concentration Warnings ────────────────────────────────────────────────
+    if alloc["concentration_warnings"]:
+        st.markdown("<div class='sec-hdr'>Concentration Warnings</div>",
+                    unsafe_allow_html=True)
+        for w in alloc["concentration_warnings"]:
+            st.markdown(
+                "<div class='alert-warn'>%s <b>%s</b></div>" % (w["icon"], w["msg"]),
+                unsafe_allow_html=True,
+            )
+
+    # ── Recommended Deployments ───────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Recommended Deployment Today</div>",
+                unsafe_allow_html=True)
+
+    if not alloc["candidates"]:
+        st.info("No actionable opportunities at current prices. Hold cash.")
+    else:
+        total_suggested = sum(c["suggested_amount"] for c in alloc["candidates"])
+        st.markdown(
+            "<div class='mono-sm' style='margin-bottom:0.8rem;color:#64748B;'>"
+            "Total suggested: <b style='color:#F1F5F9;'>%s</b> of %s deployable</div>" % (
+                fmt_usd(total_suggested, 0), fmt_usd(alloc["deployable_cash"], 0)),
+            unsafe_allow_html=True,
+        )
+
+        for c in alloc["candidates"]:
+            r_icon, r_color, r_bg = RATING_STYLES.get(
+                c["rating"], ("--", "#94A3B8", "#0F1420"))
+            si    = STYLE_ICONS.get(c["style"], "")
+            score = c["alloc_score"]
+            score_bar_w = int(score)
+            score_color = ("#10B981" if score >= 70 else
+                           "#3B82F6" if score >= 50 else "#F59E0B")
+
+            mos_str    = ("%+.1f%%" % c["mos"])    if c["mos"]    is not None else "N/A"
+            upside_str = ("%+.1f%%" % c["upside"]) if c["upside"] is not None else "N/A"
+
+            st.markdown(
+                "<div class='card' style='border-left:4px solid %s;margin-bottom:0.6rem;'>"
+                # Header
+                "<div style='display:flex;justify-content:space-between;"
+                "align-items:flex-start;flex-wrap:wrap;gap:0.5rem;'>"
+                "<div>"
+                "<span style='font-family:DM Serif Display,serif;font-size:1.2rem;"
+                "color:#F1F5F9;'>%s</span>"
+                "<span style='margin-left:8px;font-size:0.75rem;color:#64748B;'>%s</span><br>"
+                "<span class='mono-sm'>%s %s · %s · %s</span>"
+                "</div>"
+                "<div style='text-align:right;'>"
+                "<div style='font-family:DM Serif Display,serif;font-size:1.5rem;"
+                "color:#10B981;'>%s</div>"
+                "<span style='background:%s;color:%s;border:1px solid %s;"
+                "border-radius:20px;padding:2px 10px;font-family:DM Mono,monospace;"
+                "font-size:0.72rem;font-weight:600;'>%s %s</span>"
+                "</div>"
+                "</div>"
+                # Score bar
+                "<div style='margin-top:0.8rem;'>"
+                "<div style='display:flex;justify-content:space-between;"
+                "margin-bottom:4px;'>"
+                "<span class='mono-sm'>Allocation Score</span>"
+                "<span style='font-family:DM Mono,monospace;font-size:0.8rem;"
+                "color:%s;font-weight:600;'>%.0f / 100</span>"
+                "</div>"
+                "<div style='background:#1E2433;border-radius:4px;height:6px;'>"
+                "<div style='width:%d%%;background:%s;border-radius:4px;height:6px;'>"
+                "</div></div></div>"
+                # Metrics row
+                "<div style='display:flex;gap:1.5rem;margin-top:0.8rem;flex-wrap:wrap;'>"
+                "<div><div class='mono-sm'>Quality</div>"
+                "<div class='mono-val'>%s / 10</div></div>"
+                "<div><div class='mono-sm'>Risk</div>"
+                "<div class='mono-val'>%s / 10</div></div>"
+                "<div><div class='mono-sm'>Margin of Safety</div>"
+                "<div class='mono-val'>%s</div></div>"
+                "<div><div class='mono-sm'>Analyst Upside</div>"
+                "<div class='mono-val'>%s</div></div>"
+                "<div><div class='mono-sm'>Current Weight</div>"
+                "<div class='mono-val'>%.1f%%</div></div>"
+                "</div>"
+                "</div>" % (
+                    score_color,
+                    c["ticker"], c["name"],
+                    si, c["style"], c["sector"], c["status"],
+                    fmt_usd(c["suggested_amount"], 0),
+                    r_bg, r_color, r_color, r_icon, c["rating"],
+                    score_color, score,
+                    score_bar_w, score_color,
+                    c["quality"] if c["quality"] else "N/A",
+                    c["risk"]    if c["risk"]    else "N/A",
+                    mos_str, upside_str,
+                    c["current_w"],
+                ),
+                unsafe_allow_html=True,
+            )
+
+    # ── Sector Headroom ───────────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Sector Capacity Remaining</div>",
+                unsafe_allow_html=True)
+    sw = alloc["sector_weights"]
+    sh = alloc["sector_headroom"]
+    for sec in sorted(sw, key=lambda x: -sw[x]):
+        w    = sw[sec]
+        room = sh.get(sec, 0)
+        bar_w = min(100, int(w / 40 * 100))
+        bar_color = ("#EF4444" if w >= 40 else
+                     "#F59E0B" if w >= 30 else "#10B981")
+        st.markdown(
+            "<div class='card' style='padding:0.6rem 1rem;margin-bottom:0.3rem;'>"
+            "<div style='display:flex;justify-content:space-between;"
+            "align-items:center;margin-bottom:5px;'>"
+            "<span style='font-family:DM Sans,sans-serif;font-size:0.85rem;"
+            "color:#CBD5E1;'>%s</span>"
+            "<span class='mono-val'>%.1f%% &nbsp;"
+            "<span style='color:#475569;font-size:0.75rem;'>"
+            "(room: %s)</span></span>"
+            "</div>"
+            "<div style='background:#1E2433;border-radius:3px;height:5px;'>"
+            "<div style='width:%d%%;background:%s;border-radius:3px;height:5px;'>"
+            "</div></div></div>" % (
+                sec, w,
+                fmt_usd(room, 0),
+                bar_w, bar_color,
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — RECOMMENDATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[5]:
     if not d["recommendations"]:
         st.success("✅ No immediate actions required.")
     else:
@@ -666,9 +837,9 @@ with tabs[4]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — UPDATE PORTFOLIO
+# TAB 7 — UPDATE PORTFOLIO
 # ══════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
+with tabs[6]:
     # Cash
     st.markdown("<div class='sec-hdr'>Cash Balance</div>", unsafe_allow_html=True)
     new_cash = st.number_input("Cash (USD)", min_value=0.0,
