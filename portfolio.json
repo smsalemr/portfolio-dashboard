@@ -1,0 +1,127 @@
+{
+  "holdings": [
+    {
+      "ticker": "MSFT",
+      "name": "Microsoft Corporation",
+      "sector": "Technology",
+      "style": "Compounder",
+      "status": "Owned",
+      "shares": 70,
+      "avg_buy": 441.70,
+      "current_price": 441.70,
+      "target_entry": null,
+      "notes": ""
+    },
+    {
+      "ticker": "NOW",
+      "name": "ServiceNow Inc.",
+      "sector": "Enterprise Software",
+      "style": "Growth",
+      "status": "Owned",
+      "shares": 200,
+      "avg_buy": 128.90,
+      "current_price": 124.90,
+      "target_entry": null,
+      "notes": "Broker-confirmed position"
+    },
+    {
+      "ticker": "AAPL",
+      "name": "Apple Inc.",
+      "sector": "Technology",
+      "style": "Compounder",
+      "status": "Watchlist",
+      "shares": 0,
+      "avg_buy": 0,
+      "current_price": null,
+      "target_entry": 190.00,
+      "notes": ""
+    },
+    {
+      "ticker": "NVDA",
+      "name": "NVIDIA Corporation",
+      "sector": "Technology",
+      "style": "Growth",
+      "status": "Watchlist",
+      "shares": 0,
+      "avg_buy": 0,
+      "current_price": null,
+      "target_entry": 110.00,
+      "notes": ""
+    },
+    {
+      "ticker": "TSLA",
+      "name": "Tesla Inc.",
+      "sector": "EV / Technology",
+      "style": "Growth",
+      "status": "Watchlist",
+      "shares": 0,
+      "avg_buy": 0,
+      "current_price": null,
+      "target_entry": 220.00,
+      "notes": ""
+    },
+    {
+      "ticker": "CAT",
+      "name": "Caterpillar Inc.",
+      "sector": "Industrials",
+      "style": "Cyclical",
+      "status": "Watchlist",
+      "shares": 0,
+      "avg_buy": 0,
+      "current_price": null,
+      "target_entry": 350.00,
+      "notes": ""
+    },
+    {
+      "ticker": "XOM",
+      "name": "Exxon Mobil Corporation",
+      "sector": "Energy",
+      "style": "Cyclical",
+      "status": "Watchlist",
+      "shares": 0,
+      "avg_buy": 0,
+      "current_price": null,
+      "target_entry": 100.00,
+      "notes": ""
+    },
+    {
+      "ticker": "BRK.B",
+      "name": "Berkshire Hathaway B",
+      "sector": "Financial",
+      "style": "Value",
+      "status": "Watchlist",
+      "shares": 0,
+      "avg_buy": 0,
+      "current_price": null,
+      "target_entry": 420.00,
+      "notes": ""
+    },
+    {
+      "ticker": "CELH",
+      "name": "Celsius Holdings Inc.",
+      "sector": "Consumer",
+      "style": "Speculative",
+      "status": "Watchlist",
+      "shares": 0,
+      "avg_buy": 0,
+      "current_price": null,
+      "target_entry": 25.00,
+      "notes": ""
+    },
+    {
+      "ticker": "HIMS",
+      "name": "Hims & Hers Health Inc.",
+      "sector": "Healthcare",
+      "style": "Speculative",
+      "status": "Watchlist",
+      "shares": 0,
+      "avg_buy": 0,
+      "current_price": null,
+      "target_entry": 28.00,
+      "notes": ""
+    }
+  ],
+  "cash": 49000.00,
+  "currency": "USD",
+  "last_updated": "2025-06-03"
+}
