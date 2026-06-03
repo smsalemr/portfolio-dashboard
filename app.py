@@ -15,7 +15,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import json, os
 from datetime import datetime, timezone
-from engine import load_portfolio, save_portfolio, fetch_prices, compute_portfolio, STYLE_ICONS
+from engine import (load_portfolio, save_portfolio, fetch_prices, compute_portfolio,
+                   fetch_analysis, compute_analysis, STYLE_ICONS, RATING_STYLES)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -206,12 +207,22 @@ def refresh_computed(portfolio_data=None, live_prices=None):
     st.session_state.computed = compute_portfolio(data, prices)
 
 def fetch_and_compute(portfolio_data=None):
-    """Fetch live prices then recompute. Called on load and manual refresh."""
+    """Fetch live prices + analysis then recompute. Called on load and manual refresh."""
     data    = portfolio_data or st.session_state.portfolio
     tickers = [h["ticker"] for h in data["holdings"]]
+    # Fetch prices
     prices  = fetch_prices(tickers)
     st.session_state.live_prices = prices
     st.session_state.computed    = compute_portfolio(data, prices)
+    # Fetch analysis (separate yfinance call for fundamentals)
+    try:
+        raw_analysis = fetch_analysis(tickers)
+        holdings_map = {h["ticker"]: h for h in data["holdings"]}
+        st.session_state.analysis = compute_analysis(
+            tickers, raw_analysis, prices, holdings_map
+        )
+    except Exception:
+        st.session_state.analysis = {}
 
 # Load portfolio data
 if "portfolio" not in st.session_state:
@@ -277,7 +288,7 @@ with h3:
 st.markdown("<hr class='divider'>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "💡 Recs", "✏️ Update"])
+tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💡 Recs", "✏️ Update"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -435,9 +446,177 @@ with tabs[2]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — RECOMMENDATIONS
+# TAB 4 — ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
+    analysis = st.session_state.get("analysis", {})
+    summary  = analysis.get("__summary__", {})
+    p_data   = st.session_state.portfolio
+    all_tickers = [h["ticker"] for h in p_data["holdings"]]
+
+    if not analysis or not summary.get("rated"):
+        st.info("Analysis data not loaded yet. Tap ⟳ to fetch live data.")
+    else:
+        # ── Portfolio Summary Bar ─────────────────────────────────────────────
+        st.markdown("<div class='sec-hdr'>Portfolio Quality Summary</div>", unsafe_allow_html=True)
+        sq1, sq2, sq3, sq4 = st.columns(4)
+        aq = summary.get("avg_quality")
+        ar = summary.get("avg_risk")
+        bo = summary.get("best_opp")
+        bod= summary.get("best_opp_data") or {}
+
+        sq1.metric("Avg Quality Score", f"{aq}/10" if aq else "N/A",
+                   "Higher = better fundamentals")
+        sq2.metric("Avg Risk Score",    f"{ar}/10" if ar else "N/A",
+                   "Lower = less risky")
+        sq3.metric("Stocks Rated",      f"{summary.get('rated',0)} / {summary.get('total_tickers',0)}")
+        sq4.metric("Best Opportunity",  bo or "None",
+                   f"↑{bod.get('upside',0):+.1f}% upside" if bod.get("upside") else "")
+
+        # Cash deployment suggestion
+        cash = d["cash"]
+        grand = d["grand_total"]
+        if cash > 5000:
+            best_buy_rated = [a for t, a in analysis.items()
+                              if t != "__summary__" and isinstance(a, dict)
+                              and a.get("rating") in ("Strong Buy","Buy")
+                              and a.get("has_data")]
+            if best_buy_rated:
+                best_buy_rated.sort(key=lambda x: (-(x.get("upside") or 0)))
+                top = best_buy_rated[0]
+                st.markdown(
+                    f"<div class='alert-info' style='margin:0.5rem 0 1rem;'>"
+                    f"💰 <b>Cash Deployment:</b> ${cash:,.0f} available. "
+                    f"Top-rated opportunity: <b>{top['ticker']}</b> ({top['rating']}) "
+                    f"— analyst target ${top.get('analyst_target') or 0:,.2f}, "
+                    f"upside {top.get('upside') or 0:+.1f}%. "
+                    f"Quality {top.get('quality')}/10 · Risk {top.get('risk')}/10</div>",
+                    unsafe_allow_html=True,
+                )
+
+        # ── Per-stock cards ───────────────────────────────────────────────────
+        st.markdown("<div class='sec-hdr'>Stock Analysis</div>", unsafe_allow_html=True)
+
+        def pct_str(v, mult=100):
+            if v is None: return "N/A"
+            return f"{v*mult:+.1f}%"
+
+        def val_str(v, prefix="", suffix="", dec=2):
+            if v is None: return "N/A"
+            return f"{prefix}{v:.{dec}f}{suffix}"
+
+        def analysis_row(label, value, good_threshold=None, bad_threshold=None,
+                         higher_is_good=True, suffix=""):
+            """Render a metric row with optional color coding."""
+            if value == "N/A" or value is None:
+                color = "#475569"
+            elif good_threshold is not None and bad_threshold is not None:
+                try:
+                    v = float(str(value).replace("%","").replace("$","").replace(",",""))
+                    if higher_is_good:
+                        color = "#4ADE80" if v >= good_threshold else "#F87171" if v <= bad_threshold else "#CBD5E1"
+                    else:
+                        color = "#4ADE80" if v <= good_threshold else "#F87171" if v >= bad_threshold else "#CBD5E1"
+                except: color = "#CBD5E1"
+            else:
+                color = "#CBD5E1"
+            return (f"<div style='display:flex;justify-content:space-between;"
+                    f"padding:4px 0;border-bottom:1px solid #1E2433;'>"
+                    f"<span class='mono-sm'>{label}</span>"
+                    f"<span style='font-family:DM Mono,monospace;font-size:0.82rem;color:{color};'>"
+                    f"{value}{suffix}</span></div>")
+
+        for ticker in all_tickers:
+            a = analysis.get(ticker)
+            if not a or not isinstance(a, dict):
+                continue
+
+            rating      = a.get("rating", "Hold")
+            r_icon      = a.get("rating_icon", "")
+            r_color     = a.get("rating_color", "#94A3B8")
+            r_bg        = a.get("rating_bg", "#0F1420")
+            has_data    = a.get("has_data", False)
+            status_label= f"{'Owned' if a.get('status')=='Owned' else 'Watchlist'}"
+            style_icon  = STYLE_ICONS.get(a.get("style",""), "")
+
+            st.markdown(
+                f"<div class='card' style='border-left:4px solid {r_color};margin-bottom:1rem;'>"
+                # Header row
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"flex-wrap:wrap;gap:0.5rem;margin-bottom:0.8rem;'>"
+                f"<div>"
+                f"<span style='font-family:DM Serif Display,serif;font-size:1.3rem;color:#F1F5F9;'>{ticker}</span>"
+                f"<span style='margin-left:8px;font-size:0.75rem;color:#64748B;'>{a.get('name','')}</span><br>"
+                f"<span class='mono-sm'>{style_icon} {a.get('style','')} · {status_label}</span>"
+                f"</div>"
+                f"<div style='text-align:right;'>"
+                f"<span style='background:{r_bg};color:{r_color};border:1px solid {r_color};"
+                f"border-radius:20px;padding:4px 14px;font-family:DM Mono,monospace;"
+                f"font-size:0.78rem;font-weight:600;'>{r_icon} {rating}</span><br>"
+                f"<span class='mono-sm' style='margin-top:4px;display:block;'>"
+                f"Quality {a.get('quality','N/A')}/10 &nbsp;·&nbsp; Risk {a.get('risk','N/A')}/10</span>"
+                f"</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            if not has_data:
+                st.markdown("<div style='color:#475569;font-size:0.8rem;padding:0.5rem 0;'>No live data available — tap ⟳ to refresh.</div></div>", unsafe_allow_html=True)
+                continue
+
+            # Two-column metrics grid
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                upside_str = f"{a.get('upside'):+.1f}%" if a.get('upside') is not None else "N/A"
+                st.markdown(
+                    analysis_row("Current Price",     f"${a.get('current') or 0:,.2f}") +
+                    analysis_row("Analyst Target",    f"${a.get('analyst_target') or 0:,.2f}" if a.get('analyst_target') else "N/A") +
+                    analysis_row("Upside to Target",  upside_str, 10, -5) +
+                    analysis_row("Fair Value Est.",   f"${a.get('fair_value') or 0:,.2f}" if a.get('fair_value') else "N/A") +
+                    analysis_row("Margin of Safety",  f"{a.get('mos') or 0:+.1f}%" if a.get('mos') is not None else "N/A", 15, -5) +
+                    analysis_row("# Analysts",        str(a.get('analyst_count')) if a.get('analyst_count') else "N/A"),
+                    unsafe_allow_html=True,
+                )
+            with mc2:
+                st.markdown(
+                    analysis_row("Forward P/E",       val_str(a.get('forward_pe'), dec=1), None, None) +
+                    analysis_row("PEG Ratio",         val_str(a.get('peg'), dec=2), 1.5, 3.0, higher_is_good=False) +
+                    analysis_row("Revenue Growth",    pct_str(a.get('revenue_growth')), 10, -5) +
+                    analysis_row("Earnings Growth",   pct_str(a.get('earnings_growth')), 10, -5) +
+                    analysis_row("Profit Margin",     pct_str(a.get('profit_margin')), 15, 0) +
+                    analysis_row("Market Cap",        a.get('market_cap','N/A')),
+                    unsafe_allow_html=True,
+                )
+
+            # 52-week bar
+            curr  = a.get("current")
+            wkh   = a.get("wk52_high")
+            wkl   = a.get("wk52_low")
+            if curr and wkh and wkl and wkh > wkl:
+                pct_pos = (curr - wkl) / (wkh - wkl)
+                bar_w   = max(2, min(98, int(pct_pos * 100)))
+                st.markdown(
+                    f"<div style='margin-top:0.7rem;'>"
+                    f"<div class='mono-sm' style='margin-bottom:4px;'>52-Week Range</div>"
+                    f"<div style='display:flex;align-items:center;gap:8px;'>"
+                    f"<span class='mono-sm'>${wkl:,.0f}</span>"
+                    f"<div style='flex:1;background:#1E2433;border-radius:4px;height:6px;position:relative;'>"
+                    f"<div style='position:absolute;left:{bar_w}%;top:-3px;width:12px;height:12px;"
+                    f"background:{r_color};border-radius:50%;transform:translateX(-50%);'></div>"
+                    f"</div>"
+                    f"<span class='mono-sm'>${wkh:,.0f}</span>"
+                    f"</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+            # Close card div
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — RECOMMENDATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[4]:
     if not d["recommendations"]:
         st.success("✅ No immediate actions required.")
     else:
@@ -487,9 +666,9 @@ with tabs[3]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — UPDATE PORTFOLIO
+# TAB 6 — UPDATE PORTFOLIO
 # ══════════════════════════════════════════════════════════════════════════════
-with tabs[4]:
+with tabs[5]:
     # Cash
     st.markdown("<div class='sec-hdr'>Cash Balance</div>", unsafe_allow_html=True)
     new_cash = st.number_input("Cash (USD)", min_value=0.0,
