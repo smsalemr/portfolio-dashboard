@@ -49,15 +49,32 @@ RATING_STYLES = {
 
 
 def load_portfolio():
-    with open(DATA_PATH) as f:
-        return json.load(f)
+    """Delegate to db.py persistence layer."""
+    try:
+        from db import load_portfolio as _load
+        return _load()
+    except ImportError:
+        # Fallback: read local file directly
+        if not os.path.exists(DATA_PATH):
+            return {"holdings": [], "cash": 0.0, "currency": "USD"}
+        with open(DATA_PATH) as f:
+            return json.load(f)
 
 
 def save_portfolio(data):
+    """Delegate to db.py persistence layer."""
+    try:
+        from db import save_portfolio as _save
+        _save(data)
+        return
+    except ImportError:
+        pass
+    # Fallback: local file
     clean = json.loads(json.dumps(data))
     for h in clean.get("holdings", []):
         for k in ("current_price", "prev_close", "change_pct"):
             h.pop(k, None)
+    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
     with open(DATA_PATH, "w") as f:
         json.dump(clean, f, indent=2)
 
@@ -732,4 +749,257 @@ def compute_allocation(data, live_prices=None, analysis=None):
         "sector_weights":         sector_weights,
         "sector_headroom":        sector_headroom,
         "pos_weights":            pos_weights,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PORTFOLIO RISK ENGINE  (Phase 4)
+# ---------------------------------------------------------------------------
+
+def compute_risk_report(data, live_prices=None):
+    """
+    Portfolio Risk Engine.
+
+    Returns:
+      position_scores      - {ticker: concentration_score 0-100}
+      sector_scores        - {sector: concentration_score 0-100}
+      position_alerts      - list of dicts for positions > 20%
+      sector_alerts        - list of dicts for sectors > 40%
+      diversification      - int 0-100
+      stress_tests         - list of scenario dicts
+      overall_risk_level   - "Low" | "Moderate" | "Elevated" | "High"
+      overall_risk_score   - int 0-100 (higher = riskier)
+    """
+
+    holdings  = data["holdings"]
+    cash      = float(data.get("cash", 0))
+    lp        = live_prices or {}
+
+    # Build position market values
+    pos_mv    = {}
+    pos_sector= {}
+    pos_style = {}
+    pos_name  = {}
+
+    for h in holdings:
+        if h["status"] != "Owned" or float(h.get("shares", 0)) == 0:
+            continue
+        ticker  = h["ticker"]
+        price   = (lp.get(ticker) or {}).get("price") or float(h["avg_buy"])
+        mv      = float(h["shares"]) * price
+        pos_mv[ticker]     = mv
+        pos_sector[ticker] = h["sector"]
+        pos_style[ticker]  = h.get("style", "")
+        pos_name[ticker]   = h["name"]
+
+    total_equity = sum(pos_mv.values())
+    grand        = total_equity + cash
+    n_positions  = len(pos_mv)
+
+    if grand <= 0:
+        grand = 1.0
+
+    # ── Position weights ──────────────────────────────────────────────────────
+    pos_weights = {t: round(mv / grand * 100, 2) for t, mv in pos_mv.items()}
+
+    # ── Sector weights ────────────────────────────────────────────────────────
+    sector_mv = {}
+    for t, mv in pos_mv.items():
+        s = pos_sector[t]
+        sector_mv[s] = sector_mv.get(s, 0) + mv
+    sector_weights = {s: round(v / grand * 100, 2) for s, v in sector_mv.items()}
+
+    # ── Position concentration scores (0-100, higher = more concentrated) ────
+    # Score = position_weight / 25 * 100, capped at 100
+    position_scores = {
+        t: min(100, round(w / 25 * 100, 1))
+        for t, w in pos_weights.items()
+    }
+
+    # ── Sector concentration scores ───────────────────────────────────────────
+    sector_scores = {
+        s: min(100, round(w / 40 * 100, 1))
+        for s, w in sector_weights.items()
+    }
+
+    # ── Position alerts (> 20%) ───────────────────────────────────────────────
+    position_alerts = []
+    for t, w in sorted(pos_weights.items(), key=lambda x: -x[1]):
+        if w > 20:
+            severity = "CRITICAL" if w > 35 else "WARNING"
+            position_alerts.append({
+                "ticker":   t,
+                "name":     pos_name[t],
+                "weight":   w,
+                "mv":       pos_mv[t],
+                "severity": severity,
+                "msg":      "%s is %.1f%% of portfolio (alert > 20%%)" % (t, w),
+            })
+
+    # ── Sector alerts (> 40%) ─────────────────────────────────────────────────
+    sector_alerts = []
+    for s, w in sorted(sector_weights.items(), key=lambda x: -x[1]):
+        if w > 40:
+            severity = "CRITICAL" if w > 60 else "WARNING"
+            sector_alerts.append({
+                "sector":   s,
+                "weight":   w,
+                "mv":       sector_mv[s],
+                "severity": severity,
+                "msg":      "%s sector is %.1f%% of portfolio (alert > 40%%)" % (s, w),
+            })
+
+    # ── Diversification score (0-100, higher = better diversified) ────────────
+    # Components:
+    #   30pts — number of positions (max at 10+)
+    #   25pts — number of sectors   (max at 5+)
+    #   25pts — Herfindahl index (lower HHI = better)
+    #   20pts — cash buffer presence (0-20% is good, >40% penalised slightly)
+
+    # 1. Position count score
+    pos_count_score = min(30, n_positions / 10 * 30)
+
+    # 2. Sector count score
+    n_sectors = len(sector_mv)
+    sector_count_score = min(25, n_sectors / 5 * 25)
+
+    # 3. HHI (sum of squared weights), lower is better
+    if pos_weights:
+        hhi = sum((w / 100) ** 2 for w in pos_weights.values())
+        # HHI of 1.0 = totally concentrated (0 pts), 0.1 = well spread (25 pts)
+        hhi_score = max(0, min(25, (1 - hhi) / 0.9 * 25))
+    else:
+        hhi_score = 0
+
+    # 4. Cash buffer score
+    cash_pct = cash / grand * 100
+    if 5 <= cash_pct <= 25:
+        cash_score = 20
+    elif cash_pct < 5:
+        cash_score = 5
+    elif cash_pct <= 40:
+        cash_score = 15
+    else:
+        cash_score = 10   # too much idle cash also a mild negative
+
+    diversification = round(pos_count_score + sector_count_score + hhi_score + cash_score)
+    diversification = max(0, min(100, diversification))
+
+    # ── Stress tests ──────────────────────────────────────────────────────────
+    TECH_SECTORS = {"Technology", "Enterprise Software", "EV / Technology"}
+
+    tech_equity = sum(mv for t, mv in pos_mv.items()
+                      if pos_sector[t] in TECH_SECTORS)
+
+    scenarios = [
+        {
+            "name":        "Tech Sell-Off -10%",
+            "description": "Technology sector drops 10%",
+            "icon":        "📉",
+            "color":       "#F59E0B",
+            "shocks": {s: -0.10 for s in TECH_SECTORS},
+        },
+        {
+            "name":        "Tech Crash -20%",
+            "description": "Technology sector drops 20%",
+            "icon":        "⚠️",
+            "color":       "#F97316",
+            "shocks": {s: -0.20 for s in TECH_SECTORS},
+        },
+        {
+            "name":        "Market Crash -30%",
+            "description": "All equity positions drop 30%",
+            "icon":        "🚨",
+            "color":       "#EF4444",
+            "shocks": "__all__",
+        },
+    ]
+
+    stress_tests = []
+    for sc in scenarios:
+        loss_equity = 0.0
+        ticker_impacts = {}
+        for t, mv in pos_mv.items():
+            sec = pos_sector[t]
+            if sc["shocks"] == "__all__":
+                shock = -0.30
+            else:
+                shock = sc["shocks"].get(sec, 0.0)
+            loss   = mv * shock
+            loss_equity += loss
+            if shock != 0:
+                ticker_impacts[t] = {
+                    "mv":     mv,
+                    "loss":   loss,
+                    "shock":  shock * 100,
+                    "weight": pos_weights[t],
+                }
+
+        new_portfolio_value = grand + loss_equity
+        pct_drop = round(loss_equity / grand * 100, 2) if grand else 0
+
+        stress_tests.append({
+            "name":              sc["name"],
+            "description":       sc["description"],
+            "icon":              sc["icon"],
+            "color":             sc["color"],
+            "loss_dollar":       round(loss_equity, 2),
+            "pct_drop":          pct_drop,
+            "new_value":         round(new_portfolio_value, 2),
+            "ticker_impacts":    ticker_impacts,
+        })
+
+    # ── Overall risk score and level ──────────────────────────────────────────
+    risk_score = 0
+
+    # Concentration risk (0-40 pts)
+    max_pos_w = max(pos_weights.values(), default=0)
+    if max_pos_w > 40:   risk_score += 40
+    elif max_pos_w > 30: risk_score += 28
+    elif max_pos_w > 20: risk_score += 16
+    elif max_pos_w > 10: risk_score += 6
+
+    # Sector risk (0-25 pts)
+    max_sec_w = max(sector_weights.values(), default=0)
+    if max_sec_w > 70:   risk_score += 25
+    elif max_sec_w > 50: risk_score += 18
+    elif max_sec_w > 40: risk_score += 10
+    elif max_sec_w > 30: risk_score += 4
+
+    # Diversification (0-20 pts) — inverse
+    risk_score += round((1 - diversification / 100) * 20)
+
+    # Stress test worst loss (0-15 pts)
+    worst_pct = min(st["pct_drop"] for st in stress_tests) if stress_tests else 0
+    if worst_pct < -25:   risk_score += 15
+    elif worst_pct < -15: risk_score += 10
+    elif worst_pct < -10: risk_score += 5
+
+    risk_score = max(0, min(100, risk_score))
+
+    if risk_score >= 70:   risk_level, risk_color = "High",     "#EF4444"
+    elif risk_score >= 45: risk_level, risk_color = "Elevated", "#F97316"
+    elif risk_score >= 25: risk_level, risk_color = "Moderate", "#F59E0B"
+    else:                  risk_level, risk_color = "Low",      "#10B981"
+
+    return {
+        "pos_weights":        pos_weights,
+        "sector_weights":     sector_weights,
+        "sector_mv":          sector_mv,
+        "pos_mv":             pos_mv,
+        "pos_name":           pos_name,
+        "pos_sector":         pos_sector,
+        "position_scores":    position_scores,
+        "sector_scores":      sector_scores,
+        "position_alerts":    position_alerts,
+        "sector_alerts":      sector_alerts,
+        "diversification":    diversification,
+        "stress_tests":       stress_tests,
+        "overall_risk_score": risk_score,
+        "overall_risk_level": risk_level,
+        "overall_risk_color": risk_color,
+        "n_positions":        n_positions,
+        "n_sectors":          n_sectors,
+        "grand_total":        grand,
+        "cash_pct":           round(cash / grand * 100, 1),
     }
