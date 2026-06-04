@@ -156,25 +156,39 @@ def _local_save(portfolio: dict) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_portfolio() -> dict:
-    """Load portfolio from the active backend. Never raises."""
-    try:
-        if _backend() == "gist":
-            return _gist_load()
-    except Exception:
-        pass  # fall through to local
+    """
+    Load portfolio from the active backend.
+    Gist is authoritative — local file is never used as source of truth.
+    Never raises.
+    """
+    if _backend() == "gist":
+        try:
+            data = _gist_load()
+            # Validate we got real data (not empty default)
+            if data and isinstance(data.get("holdings"), list):
+                return data
+        except Exception:
+            pass
+        # Gist failed — return empty rather than stale local data
+        return dict(DEFAULT_PORTFOLIO)
+    # Local mode
     return _local_load()
 
 
 def save_portfolio(portfolio: dict) -> bool:
-    """Save portfolio to the active backend. Returns True on success."""
-    # Always save locally as a cache/fallback
-    _local_save(portfolio)
+    """
+    Save portfolio to the active backend.
+    In Gist mode: Gist is the only source of truth.
+    Local file is NOT written in Gist mode to avoid stale data conflicts.
+    Returns True on success.
+    """
     if _backend() == "gist":
         try:
             return _gist_save(portfolio)
-        except Exception:
+        except Exception as e:
             return False
-    return True
+    # Local mode only
+    return _local_save(portfolio)
 
 
 def get_backend_name() -> str:
