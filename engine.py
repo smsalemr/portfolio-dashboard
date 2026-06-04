@@ -80,12 +80,58 @@ def save_portfolio(data):
 
 
 def fetch_prices(tickers):
+    """
+    Fetch real-time prices via Finnhub (primary) with Yahoo Finance fallback.
+    Finnhub key read from Streamlit secrets: FINNHUB_KEY
+    """
     results = {t: None for t in tickers}
     if not tickers:
         return results
+
+    # ── Try Finnhub first ─────────────────────────────────────────────────────
+    finnhub_key = None
+    try:
+        import streamlit as st
+        finnhub_key = st.secrets.get("FINNHUB_KEY")
+    except Exception:
+        pass
+    if not finnhub_key:
+        import os
+        finnhub_key = os.environ.get("FINNHUB_KEY")
+
+    if finnhub_key:
+        import urllib.request
+        success_count = 0
+        for ticker in tickers:
+            try:
+                url = "https://finnhub.io/api/v1/quote?symbol=%s&token=%s" % (ticker, finnhub_key)
+                req = urllib.request.Request(url, headers={"User-Agent": "PortfolioApp/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    data = json.loads(r.read())
+                curr = data.get("c")   # current price
+                prev = data.get("pc")  # previous close
+                if curr and curr > 0:
+                    curr = round(float(curr), 2)
+                    prev = round(float(prev), 2) if prev else curr
+                    chg  = round(((curr - prev) / prev) * 100, 2) if prev else 0.0
+                    results[ticker] = {
+                        "price":      curr,
+                        "prev_close": prev,
+                        "change_pct": chg,
+                        "market_cap": None,
+                    }
+                    success_count += 1
+            except Exception:
+                pass
+        if success_count > 0:
+            return results   # Finnhub worked — return immediately
+
+    # ── Fallback: Yahoo Finance ───────────────────────────────────────────────
     try:
         import yfinance as yf
         for ticker in tickers:
+            if results.get(ticker):
+                continue   # already fetched by Finnhub
             try:
                 info = yf.Ticker(ticker).info
                 curr = (info.get("currentPrice")
@@ -108,6 +154,7 @@ def fetch_prices(tickers):
                 pass
     except ImportError:
         pass
+
     return results
 
 
