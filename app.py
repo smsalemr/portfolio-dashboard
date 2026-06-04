@@ -15,12 +15,97 @@ import streamlit as st
 import plotly.graph_objects as go
 import json, os
 from datetime import datetime, timezone
-from engine import (fetch_prices, compute_portfolio,
+from engine import (load_portfolio, save_portfolio,
+                   fetch_prices, compute_portfolio,
                    fetch_analysis, compute_analysis, compute_allocation, compute_risk_report,
                    STYLE_ICONS, RATING_STYLES)
-from db import (load_portfolio, save_portfolio, get_backend_name,
-                upsert_holding, delete_holding, set_cash,
-                export_csv, import_csv)
+
+# ── Inline helpers (formerly in db.py) ───────────────────────────────────────
+def get_backend_name():
+    try:
+        import streamlit as st
+        if st.secrets.get("GIST_TOKEN") and st.secrets.get("GIST_ID"):
+            return "GitHub Gist (persistent)"
+    except Exception:
+        pass
+    return "Local file (resets on cloud restart)"
+
+def upsert_holding(portfolio, holding):
+    ticker   = holding["ticker"].strip().upper()
+    holdings = portfolio.get("holdings", [])
+    existing = [i for i,h in enumerate(holdings) if h["ticker"]==ticker]
+    clean = {
+        "ticker":       ticker,
+        "name":         holding.get("name", ticker),
+        "sector":       holding.get("sector", "Other"),
+        "style":        holding.get("style", "Growth"),
+        "status":       holding.get("status", "Watchlist"),
+        "shares":       float(holding.get("shares", 0)),
+        "avg_buy":      float(holding.get("avg_buy", 0)),
+        "target_entry": holding.get("target_entry") or None,
+        "notes":        holding.get("notes", ""),
+    }
+    if existing:
+        holdings[existing[0]] = clean
+    else:
+        holdings.append(clean)
+    portfolio["holdings"] = holdings
+    return portfolio
+
+def delete_holding(portfolio, ticker):
+    ticker = ticker.strip().upper()
+    portfolio["holdings"] = [h for h in portfolio.get("holdings",[]) if h["ticker"]!=ticker]
+    return portfolio
+
+def set_cash(portfolio, amount):
+    portfolio["cash"] = round(float(amount), 2)
+    return portfolio
+
+def export_csv(portfolio):
+    import io, csv
+    fields = ["ticker","name","sector","style","status","shares","avg_buy","target_entry","notes"]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for h in portfolio.get("holdings",[]):
+        writer.writerow({f: h.get(f,"") for f in fields})
+    output.write("\n# Cash,%s\n" % portfolio.get("cash",0))
+    return output.getvalue()
+
+def import_csv(csv_text, existing_portfolio=None):
+    import io, csv as csv_mod
+    portfolio = existing_portfolio or {"holdings":[],"cash":0.0,"currency":"USD"}
+    portfolio["holdings"] = []
+    lines = csv_text.splitlines()
+    data_lines = []
+    for line in lines:
+        s = line.strip()
+        if s.startswith("# Cash,"):
+            try: portfolio["cash"] = float(s.split(",")[1])
+            except: pass
+        elif s and not s.startswith("#"):
+            data_lines.append(s)
+    if not data_lines:
+        return portfolio
+    reader = csv_mod.DictReader(data_lines)
+    for row in reader:
+        try:
+            h = {
+                "ticker":       row.get("ticker","").strip().upper(),
+                "name":         row.get("name",""),
+                "sector":       row.get("sector","Other"),
+                "style":        row.get("style","Growth"),
+                "status":       row.get("status","Watchlist"),
+                "shares":       float(row.get("shares",0) or 0),
+                "avg_buy":      float(row.get("avg_buy",0) or 0),
+                "target_entry": float(row["target_entry"]) if row.get("target_entry") else None,
+                "notes":        row.get("notes",""),
+            }
+            if h["ticker"]:
+                portfolio = upsert_holding(portfolio, h)
+        except Exception:
+            continue
+    return portfolio
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
