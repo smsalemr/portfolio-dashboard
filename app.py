@@ -15,9 +15,12 @@ import streamlit as st
 import plotly.graph_objects as go
 import json, os
 from datetime import datetime, timezone
-from engine import (load_portfolio, save_portfolio, fetch_prices, compute_portfolio,
-                   fetch_analysis, compute_analysis, compute_allocation,
+from engine import (fetch_prices, compute_portfolio,
+                   fetch_analysis, compute_analysis, compute_allocation, compute_risk_report,
                    STYLE_ICONS, RATING_STYLES)
+from db import (load_portfolio, save_portfolio, get_backend_name,
+                upsert_holding, delete_holding, set_cash,
+                export_csv, import_csv)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -270,11 +273,14 @@ with h1:
                 "font-weight:400;color:#F1F5F9;margin:0;'>Portfolio Intelligence</h1>",
                 unsafe_allow_html=True)
 with h2:
-    price_icon = "🟢" if d.get("any_live") else "🟡"
-    price_note = d.get("price_note", "")
+    price_icon   = "🟢" if d.get("any_live") else "🟡"
+    price_note   = d.get("price_note", "")
+    backend_name = get_backend_name()
+    storage_icon = "💾" if "Gist" in backend_name else "⚠️"
     st.markdown(
         f"<div class='ts' style='padding-top:8px;'>{d['ts']}<br>"
-        f"<span style='color:#4B5563;'>{price_icon} {price_note}</span></div>",
+        f"<span style='color:#4B5563;'>{price_icon} {price_note}</span><br>"
+        f"<span style='color:#374151;font-size:0.58rem;'>{storage_icon} {backend_name}</span></div>",
         unsafe_allow_html=True,
     )
 with h3:
@@ -289,7 +295,7 @@ with h3:
 st.markdown("<hr class='divider'>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💰 Allocation", "💡 Recs", "✏️ Update"])
+tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💰 Allocation", "🛡️ Risk", "💡 Recs", "✏️ Update"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -785,9 +791,256 @@ with tabs[4]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — RECOMMENDATIONS
+# TAB 6 — PORTFOLIO RISK ENGINE  (Phase 4)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[5]:
+    rr = compute_risk_report(
+        st.session_state.portfolio,
+        live_prices=st.session_state.get("live_prices"),
+    )
+
+    # ── Overall Risk Banner ───────────────────────────────────────────────────
+    st.markdown(
+        "<div style='background:%s22;border:1px solid %s44;border-left:5px solid %s;"
+        "border-radius:14px;padding:1rem 1.4rem;margin-bottom:1rem;"
+        "display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;'>"
+        "<div>"
+        "<div class='mono-sm'>Overall Portfolio Risk</div>"
+        "<div style='font-family:DM Serif Display,serif;font-size:1.8rem;"
+        "color:%s;'>%s</div>"
+        "</div>"
+        "<div style='text-align:right;'>"
+        "<div style='font-family:DM Mono,monospace;font-size:2.5rem;"
+        "font-weight:600;color:%s;'>%d</div>"
+        "<div class='mono-sm'>Risk Score / 100</div>"
+        "</div>"
+        "</div>" % (
+            rr["overall_risk_color"], rr["overall_risk_color"], rr["overall_risk_color"],
+            rr["overall_risk_color"], rr["overall_risk_level"],
+            rr["overall_risk_color"], rr["overall_risk_score"],
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    rk1, rk2, rk3, rk4 = st.columns(4)
+    rk1.metric("Positions",           str(rr["n_positions"]))
+    rk2.metric("Sectors",             str(rr["n_sectors"]))
+    rk3.metric("Diversification",     "%d / 100" % rr["diversification"])
+    rk4.metric("Cash Buffer",         "%.1f%%" % rr["cash_pct"])
+
+    # ── Alerts ────────────────────────────────────────────────────────────────
+    all_alerts = rr["position_alerts"] + rr["sector_alerts"]
+    if all_alerts:
+        st.markdown("<div class='sec-hdr'>Active Risk Alerts</div>",
+                    unsafe_allow_html=True)
+        for a in all_alerts:
+            css = "alert-crit" if a.get("severity") == "CRITICAL" else "alert-warn"
+            ico = "🚨" if a.get("severity") == "CRITICAL" else "⚠️"
+            st.markdown(
+                "<div class='%s'>%s %s</div>" % (css, ico, a["msg"]),
+                unsafe_allow_html=True,
+            )
+
+    # ── Position Concentration ────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Position Concentration</div>",
+                unsafe_allow_html=True)
+
+    if not rr["pos_weights"]:
+        st.info("No owned positions with shares entered.")
+    else:
+        for ticker in sorted(rr["pos_weights"], key=lambda t: -rr["pos_weights"][t]):
+            w     = rr["pos_weights"][ticker]
+            score = rr["position_scores"][ticker]
+            bar_w = min(100, int(w / 25 * 100))
+            color = ("#EF4444" if w > 35 else
+                     "#F97316" if w > 25 else
+                     "#F59E0B" if w > 20 else "#10B981")
+            alert_icon = " 🚨" if w > 35 else " ⚠️" if w > 20 else ""
+            st.markdown(
+                "<div class='card' style='padding:0.7rem 1.1rem;margin-bottom:0.35rem;'>"
+                "<div style='display:flex;justify-content:space-between;"
+                "align-items:center;margin-bottom:5px;'>"
+                "<span style='font-family:DM Serif Display,serif;font-size:1rem;"
+                "color:#F1F5F9;'>%s%s</span>"
+                "<div style='text-align:right;'>"
+                "<span style='font-family:DM Mono,monospace;font-size:0.9rem;"
+                "color:%s;font-weight:600;'>%.1f%%</span>"
+                "<span class='mono-sm' style='margin-left:8px;'>"
+                "Conc. Score: %.0f/100</span>"
+                "</div></div>"
+                "<div style='background:#1E2433;border-radius:3px;height:6px;'>"
+                "<div style='width:%d%%;background:%s;border-radius:3px;height:6px;'>"
+                "</div></div>"
+                "<div style='margin-top:4px;display:flex;gap:1rem;'>"
+                "<span class='mono-sm'>$%s</span>"
+                "<span class='mono-sm'>%s · %s</span>"
+                "</div>"
+                "</div>" % (
+                    ticker, alert_icon,
+                    color, w,
+                    score,
+                    bar_w, color,
+                    "{:,.0f}".format(rr["pos_mv"][ticker]),
+                    rr["pos_sector"][ticker],
+                    rr["pos_name"].get(ticker, ""),
+                ),
+                unsafe_allow_html=True,
+            )
+
+    # ── Sector Concentration ──────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Sector Concentration</div>",
+                unsafe_allow_html=True)
+
+    for sec in sorted(rr["sector_weights"], key=lambda s: -rr["sector_weights"][s]):
+        w     = rr["sector_weights"][sec]
+        score = rr["sector_scores"][sec]
+        bar_w = min(100, int(w / 40 * 100))
+        color = ("#EF4444" if w > 60 else
+                 "#F97316" if w > 40 else
+                 "#F59E0B" if w > 30 else "#10B981")
+        alert_icon = " ⚠️" if w > 40 else ""
+        st.markdown(
+            "<div class='card' style='padding:0.7rem 1.1rem;margin-bottom:0.35rem;'>"
+            "<div style='display:flex;justify-content:space-between;"
+            "align-items:center;margin-bottom:5px;'>"
+            "<span style='font-family:DM Sans,sans-serif;font-size:0.9rem;"
+            "color:#CBD5E1;'>%s%s</span>"
+            "<div style='text-align:right;'>"
+            "<span style='font-family:DM Mono,monospace;font-size:0.9rem;"
+            "color:%s;font-weight:600;'>%.1f%%</span>"
+            "<span class='mono-sm' style='margin-left:8px;'>"
+            "Conc. Score: %.0f/100</span>"
+            "</div></div>"
+            "<div style='background:#1E2433;border-radius:3px;height:6px;'>"
+            "<div style='width:%d%%;background:%s;border-radius:3px;height:6px;'>"
+            "</div></div>"
+            "</div>" % (
+                sec, alert_icon,
+                color, w,
+                score,
+                bar_w, color,
+            ),
+            unsafe_allow_html=True,
+        )
+
+    # ── Stress Tests ──────────────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Portfolio Stress Tests</div>",
+                unsafe_allow_html=True)
+
+    for st_test in rr["stress_tests"]:
+        loss    = st_test["loss_dollar"]
+        pct     = st_test["pct_drop"]
+        new_val = st_test["new_value"]
+        grand   = rr["grand_total"]
+
+        st.markdown(
+            "<div class='card' style='border-left:4px solid %s;margin-bottom:0.6rem;'>"
+            "<div style='display:flex;justify-content:space-between;"
+            "align-items:flex-start;flex-wrap:wrap;gap:0.5rem;'>"
+            "<div>"
+            "<div style='display:flex;align-items:center;gap:0.5rem;'>"
+            "<span style='font-size:1.2rem;'>%s</span>"
+            "<span style='font-family:DM Sans,sans-serif;font-size:0.95rem;"
+            "color:#CBD5E1;font-weight:600;'>%s</span>"
+            "</div>"
+            "<span class='mono-sm'>%s</span>"
+            "</div>"
+            "<div style='text-align:right;'>"
+            "<div style='font-family:DM Serif Display,serif;font-size:1.4rem;"
+            "color:%s;'>%s</div>"
+            "<div class='mono-sm'>%.2f%% portfolio impact</div>"
+            "<div class='mono-sm'>New value: $%s</div>"
+            "</div>"
+            "</div>" % (
+                st_test["color"],
+                st_test["icon"], st_test["name"],
+                st_test["description"],
+                st_test["color"],
+                ("- $%s" % "{:,.0f}".format(abs(loss))) if loss < 0 else "$0",
+                pct,
+                "{:,.0f}".format(new_val),
+            ),
+            unsafe_allow_html=True,
+        )
+
+        # Per-ticker impact breakdown
+        impacts = st_test["ticker_impacts"]
+        if impacts:
+            rows_html = ""
+            for t in sorted(impacts, key=lambda x: impacts[x]["loss"]):
+                imp = impacts[t]
+                rows_html += (
+                    "<div style='display:flex;justify-content:space-between;"
+                    "padding:3px 0;border-bottom:1px solid #1E2433;'>"
+                    "<span class='mono-sm'>%s (%.1f%% wt)</span>"
+                    "<span style='font-family:DM Mono,monospace;font-size:0.78rem;"
+                    "color:#F87171;'>- $%s (%.0f%% shock)</span>"
+                    "</div>" % (
+                        t, imp["weight"],
+                        "{:,.0f}".format(abs(imp["loss"])),
+                        abs(imp["shock"]),
+                    )
+                )
+            st.markdown(
+                "<div style='margin-top:0.6rem;padding:0.5rem 0.8rem;"
+                "background:#080B12;border-radius:8px;'>%s</div></div>" % rows_html,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Diversification breakdown ─────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Diversification Score Breakdown</div>",
+                unsafe_allow_html=True)
+
+    div_score = rr["diversification"]
+    div_color = ("#10B981" if div_score >= 70 else
+                 "#3B82F6" if div_score >= 50 else
+                 "#F59E0B" if div_score >= 30 else "#EF4444")
+
+    # Components for display
+    n_pos = rr["n_positions"]
+    n_sec = rr["n_sectors"]
+    pos_pts  = min(30, round(n_pos / 10 * 30))
+    sec_pts  = min(25, round(n_sec / 5  * 25))
+
+    div_components = [
+        ("Number of Positions",  "%d positions" % n_pos,  pos_pts, 30),
+        ("Sector Spread",        "%d sectors" % n_sec,    sec_pts, 25),
+        ("Weight Distribution",  "HHI-based",             div_score - pos_pts - sec_pts, 45),
+    ]
+
+    st.markdown(
+        "<div class='card'>"
+        "<div style='display:flex;justify-content:space-between;align-items:center;"
+        "margin-bottom:0.8rem;'>"
+        "<span style='font-family:DM Sans,sans-serif;font-size:0.95rem;"
+        "color:#CBD5E1;'>Overall Diversification</span>"
+        "<span style='font-family:DM Mono,monospace;font-size:1.2rem;"
+        "color:%s;font-weight:600;'>%d / 100</span>"
+        "</div>"
+        "<div style='background:#1E2433;border-radius:6px;height:10px;margin-bottom:0.8rem;'>"
+        "<div style='width:%d%%;background:%s;border-radius:6px;height:10px;'>"
+        "</div></div>"
+        "<div class='mono-sm' style='color:#64748B;'>"
+        "%s"
+        "</div>"
+        "</div>" % (
+            div_color, div_score,
+            div_score, div_color,
+            " &nbsp;·&nbsp; ".join([
+                "%s: %d pts" % (c[0], max(0, c[2])) for c in div_components
+            ]),
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — RECOMMENDATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[6]:
     if not d["recommendations"]:
         st.success("✅ No immediate actions required.")
     else:
@@ -837,96 +1090,173 @@ with tabs[5]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 7 — UPDATE PORTFOLIO
+# TAB 8 — UPDATE PORTFOLIO  (persistent via db.py)
 # ══════════════════════════════════════════════════════════════════════════════
-with tabs[6]:
-    # Cash
-    st.markdown("<div class='sec-hdr'>Cash Balance</div>", unsafe_allow_html=True)
-    new_cash = st.number_input("Cash (USD)", min_value=0.0,
-                               value=float(p["cash"]), step=1000.0, format="%.2f")
-    if st.button("💾 Save Cash"):
-        p["cash"] = new_cash
-        save_portfolio(p)
-        st.session_state.portfolio = p
+with tabs[7]:
+
+    def _save_and_refresh(updated_portfolio):
+        """Save to db, update session state, recompute."""
+        save_portfolio(updated_portfolio)
+        st.session_state.portfolio = updated_portfolio
         refresh_computed()
-        st.success(f"✅ Cash → {fmt_usd(new_cash, 0)}")
-        st.rerun()
 
-    # Owned
+    port = st.session_state.portfolio
+
+    # ── Storage status banner ─────────────────────────────────────────────────
+    backend = get_backend_name()
+    is_persistent = "Gist" in backend
+    if is_persistent:
+        st.markdown(
+            "<div style='background:#052E1622;border:1px solid #10B98144;"
+            "border-radius:10px;padding:0.6rem 1rem;margin-bottom:1rem;"
+            "font-family:DM Mono,monospace;font-size:0.75rem;color:#4ADE80;'>"
+            "💾 Storage: %s — changes persist across restarts.</div>" % backend,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div style='background:#1A130022;border:1px solid #F59E0B44;"
+            "border-radius:10px;padding:0.6rem 1rem;margin-bottom:1rem;"
+            "font-family:DM Mono,monospace;font-size:0.75rem;color:#FCD34D;'>"
+            "⚠️ Storage: Local file — changes will reset on Streamlit Cloud restart.<br>"
+            "To enable persistence: add GIST_TOKEN and GIST_ID to Streamlit Secrets.</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Cash ──────────────────────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Cash Balance</div>", unsafe_allow_html=True)
+    col_cash, _ = st.columns([1, 2])
+    with col_cash:
+        new_cash = st.number_input(
+            "Cash (USD)", min_value=0.0,
+            value=float(port.get("cash", 0)),
+            step=1000.0, format="%.2f",
+        )
+        if st.button("💾 Save Cash"):
+            updated = set_cash(dict(port), new_cash)
+            _save_and_refresh(updated)
+            st.success("✅ Cash updated to %s" % fmt_usd(new_cash, 0))
+            st.rerun()
+
+    # ── Owned Positions ───────────────────────────────────────────────────────
     st.markdown("<div class='sec-hdr'>Owned Positions</div>", unsafe_allow_html=True)
-    for h in [x for x in p["holdings"] if x["status"] == "Owned"]:
-        gi = p["holdings"].index(h)
-        with st.expander(f"{h['ticker']} — {h['name']}"):
+    owned_h = [h for h in port.get("holdings", []) if h["status"] == "Owned"]
+
+    if not owned_h:
+        st.info("No owned positions. Add one below.")
+    for h in owned_h:
+        with st.expander("%s — %s" % (h["ticker"], h["name"]), expanded=False):
             c1, c2 = st.columns(2)
-            ns = c1.number_input("Shares",         min_value=0.0, value=float(h["shares"]),                 step=1.0,   key=f"s_{h['ticker']}")
-            na = c2.number_input("Avg Buy ($)",     min_value=0.0, value=float(h["avg_buy"]),               step=0.01, format="%.2f", key=f"a_{h['ticker']}")
-            np_ = st.number_input("Current Price ($)", min_value=0.0,
-                                   value=float(h.get("current_price") or h["avg_buy"]),
-                                   step=0.01, format="%.2f", key=f"cp_{h['ticker']}")
-            nn = st.text_input("Notes", value=h.get("notes",""), key=f"n_{h['ticker']}")
+            ns  = c1.number_input("Shares",       min_value=0.0, value=float(h.get("shares",0)),   step=1.0,   key="s_%s"%h["ticker"])
+            na  = c2.number_input("Avg Buy ($)",  min_value=0.0, value=float(h.get("avg_buy",0)),  step=0.01, format="%.2f", key="a_%s"%h["ticker"])
+            ncp = st.number_input("Current Price ($) — optional override", min_value=0.0, value=0.0, step=0.01, format="%.2f", key="cp_%s"%h["ticker"])
+            nn  = st.text_input("Notes", value=h.get("notes",""), key="n_%s"%h["ticker"])
+            b1, b2, b3 = st.columns(3)
+            if b1.button("💾 Save", key="sv_%s"%h["ticker"]):
+                updated_h = dict(h)
+                updated_h.update({"shares": ns, "avg_buy": na, "notes": nn})
+                if ncp > 0:
+                    updated_h["_price_override"] = ncp
+                updated = upsert_holding(dict(port), updated_h)
+                _save_and_refresh(updated)
+                st.success("✅ %s saved" % h["ticker"]); st.rerun()
+            if b2.button("→ Watchlist", key="wl_%s"%h["ticker"]):
+                updated_h = dict(h); updated_h["status"] = "Watchlist"; updated_h["shares"] = 0
+                updated = upsert_holding(dict(port), updated_h)
+                _save_and_refresh(updated)
+                st.success("↩️ Moved to Watchlist"); st.rerun()
+            if b3.button("🗑️ Delete", key="del_%s"%h["ticker"]):
+                updated = delete_holding(dict(port), h["ticker"])
+                _save_and_refresh(updated)
+                st.success("🗑️ %s deleted" % h["ticker"]); st.rerun()
 
-            b1, b2 = st.columns(2)
-            if b1.button(f"💾 Save", key=f"sv_{h['ticker']}"):
-                p["holdings"][gi].update({"shares": ns, "avg_buy": na,
-                                           "current_price": np_, "notes": nn})
-                save_portfolio(p); st.session_state.portfolio = p
-                refresh_computed(); st.success("✅ Saved"); st.rerun()
-            if b2.button(f"→ Watchlist", key=f"wl_{h['ticker']}"):
-                p["holdings"][gi]["status"] = "Watchlist"
-                p["holdings"][gi]["shares"] = 0
-                save_portfolio(p); st.session_state.portfolio = p
-                refresh_computed(); st.success(f"↩️ Moved to Watchlist"); st.rerun()
-
-    # Watchlist
+    # ── Watchlist ─────────────────────────────────────────────────────────────
     st.markdown("<div class='sec-hdr'>Watchlist</div>", unsafe_allow_html=True)
-    for h in [x for x in p["holdings"] if x["status"] == "Watchlist"]:
-        gi = p["holdings"].index(h)
-        with st.expander(f"{h['ticker']} — {h['name']}"):
+    watch_h = [h for h in port.get("holdings", []) if h["status"] == "Watchlist"]
+
+    if not watch_h:
+        st.info("No watchlist stocks.")
+    for h in watch_h:
+        with st.expander("%s — %s" % (h["ticker"], h["name"]), expanded=False):
             c1, c2 = st.columns(2)
-            nt = c1.number_input("Target Entry ($)", min_value=0.0,
-                                  value=float(h.get("target_entry") or 0),
-                                  step=0.50, format="%.2f", key=f"te_{h['ticker']}")
-            nc = c2.number_input("Current Price ($)", min_value=0.0,
-                                  value=float(h.get("current_price") or 0),
-                                  step=0.01, format="%.2f", key=f"cwl_{h['ticker']}")
-            nn2 = st.text_input("Notes", value=h.get("notes",""), key=f"nwl_{h['ticker']}")
+            nt  = c1.number_input("Target Entry ($)", min_value=0.0,
+                                   value=float(h.get("target_entry") or 0),
+                                   step=0.50, format="%.2f", key="te_%s"%h["ticker"])
+            nc  = c2.number_input("Current Price ($) — optional", min_value=0.0,
+                                   value=0.0, step=0.01, format="%.2f",
+                                   key="cwl_%s"%h["ticker"])
+            nn2 = st.text_input("Notes", value=h.get("notes",""), key="nwl_%s"%h["ticker"])
+            b1, b2, b3 = st.columns(3)
+            if b1.button("💾 Save", key="swl_%s"%h["ticker"]):
+                updated_h = dict(h)
+                updated_h.update({"target_entry": nt if nt>0 else None, "notes": nn2})
+                if nc > 0: updated_h["_price_override"] = nc
+                updated = upsert_holding(dict(port), updated_h)
+                _save_and_refresh(updated)
+                st.success("✅ Saved"); st.rerun()
+            if b2.button("→ Owned", key="own_%s"%h["ticker"]):
+                updated_h = dict(h); updated_h["status"] = "Owned"
+                updated = upsert_holding(dict(port), updated_h)
+                _save_and_refresh(updated)
+                st.success("✅ Moved to Owned — set shares above"); st.rerun()
+            if b3.button("🗑️ Delete", key="dwl_%s"%h["ticker"]):
+                updated = delete_holding(dict(port), h["ticker"])
+                _save_and_refresh(updated)
+                st.success("🗑️ %s deleted" % h["ticker"]); st.rerun()
 
-            b1, b2 = st.columns(2)
-            if b1.button("💾 Save", key=f"swl_{h['ticker']}"):
-                p["holdings"][gi].update({
-                    "target_entry": nt if nt > 0 else None,
-                    "current_price": nc if nc > 0 else None,
-                    "notes": nn2,
-                })
-                save_portfolio(p); st.session_state.portfolio = p
-                refresh_computed(); st.success("✅ Saved"); st.rerun()
-            if b2.button("→ Owned", key=f"own_{h['ticker']}"):
-                p["holdings"][gi]["status"] = "Owned"
-                save_portfolio(p); st.session_state.portfolio = p
-                refresh_computed(); st.success("✅ Marked Owned — set shares above"); st.rerun()
-
-    # Add new
+    # ── Add New Stock ─────────────────────────────────────────────────────────
     st.markdown("<div class='sec-hdr'>Add New Stock</div>", unsafe_allow_html=True)
-    with st.expander("➕ Add stock"):
+    with st.expander("➕ Add stock", expanded=False):
         a1, a2 = st.columns(2)
-        atk  = a1.text_input("Ticker").upper().strip()
+        atk  = a1.text_input("Ticker (e.g. NVDA)").upper().strip()
         anm  = a2.text_input("Company Name")
         a3, a4 = st.columns(2)
-        asec = a3.selectbox("Sector", ["Technology","Enterprise Software","Energy","Industrials",
-                                        "Financial","Healthcare","Consumer","EV / Technology","Other"])
-        asty = a4.selectbox("Style",  ["Compounder","Growth","Cyclical","Value","Speculative"])
+        asec = a3.selectbox("Sector", ["Technology","Enterprise Software","Energy",
+                                        "Industrials","Financial","Healthcare",
+                                        "Consumer","EV / Technology","Other"])
+        asty = a4.selectbox("Style", ["Compounder","Growth","Cyclical","Value","Speculative"])
         a5, a6 = st.columns(2)
-        ast  = a5.selectbox("Status", ["Watchlist","Owned"])
-        atgt = a6.number_input("Target Entry ($)", min_value=0.0, step=0.50, format="%.2f")
+        ast_  = a5.selectbox("Status", ["Watchlist","Owned"])
+        atgt  = a6.number_input("Target Entry ($)", min_value=0.0, step=0.50, format="%.2f")
+        ash   = st.number_input("Shares (if Owned)", min_value=0.0, step=1.0)
+        aavg  = st.number_input("Avg Buy Price ($)", min_value=0.0, step=0.01, format="%.2f")
         if st.button("➕ Add"):
             if not atk or not anm:
-                st.error("Ticker and name required.")
-            elif any(h["ticker"] == atk for h in p["holdings"]):
-                st.error(f"{atk} already in portfolio.")
+                st.error("Ticker and name are required.")
+            elif any(h["ticker"] == atk for h in port.get("holdings",[])):
+                st.error("%s already exists." % atk)
             else:
-                p["holdings"].append({"ticker": atk, "name": anm, "sector": asec,
-                                       "style": asty, "status": ast, "shares": 0,
-                                       "avg_buy": 0.0, "current_price": None,
-                                       "target_entry": atgt if atgt > 0 else None, "notes": ""})
-                save_portfolio(p); st.session_state.portfolio = p
-                refresh_computed(); st.success(f"✅ {atk} added"); st.rerun()
+                new_h = {
+                    "ticker": atk, "name": anm, "sector": asec, "style": asty,
+                    "status": ast_, "shares": ash, "avg_buy": aavg,
+                    "target_entry": atgt if atgt > 0 else None, "notes": "",
+                }
+                updated = upsert_holding(dict(port), new_h)
+                _save_and_refresh(updated)
+                st.success("✅ %s added" % atk); st.rerun()
+
+    # ── CSV Backup / Restore ──────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Backup & Restore</div>", unsafe_allow_html=True)
+    bc1, bc2 = st.columns(2)
+
+    with bc1:
+        st.markdown("**Export to CSV**")
+        csv_str = export_csv(st.session_state.portfolio)
+        st.download_button(
+            label="⬇️ Download portfolio.csv",
+            data=csv_str,
+            file_name="portfolio_backup_%s.csv" % datetime.now(timezone.utc).strftime("%Y%m%d"),
+            mime="text/csv",
+        )
+
+    with bc2:
+        st.markdown("**Import from CSV**")
+        uploaded = st.file_uploader("Upload portfolio.csv", type=["csv"],
+                                     key="csv_import")
+        if uploaded:
+            csv_text = uploaded.read().decode("utf-8")
+            if st.button("📥 Import & Replace"):
+                restored = import_csv(csv_text)
+                _save_and_refresh(restored)
+                st.success("✅ Portfolio imported — %d holdings loaded" % len(restored.get("holdings",[])))
+                st.rerun()
