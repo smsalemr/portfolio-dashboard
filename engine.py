@@ -13,6 +13,7 @@ Exports required by app.py:
 """
 
 import json
+import urllib.request
 import math
 import os
 from datetime import datetime, timezone
@@ -48,35 +49,99 @@ RATING_STYLES = {
 }
 
 
-def load_portfolio():
-    """Delegate to db.py persistence layer."""
+def _get_gist_credentials():
+    """Read GIST_TOKEN and GIST_ID from Streamlit secrets or env."""
+    token = gist_id = None
     try:
-        from db import load_portfolio as _load
-        return _load()
-    except ImportError:
-        # Fallback: read local file directly
-        if not os.path.exists(DATA_PATH):
-            return {"holdings": [], "cash": 0.0, "currency": "USD"}
+        import streamlit as st
+        token   = st.secrets.get("GIST_TOKEN")
+        gist_id = st.secrets.get("GIST_ID")
+    except Exception:
+        pass
+    if not token:
+        token   = os.environ.get("GIST_TOKEN")
+        gist_id = os.environ.get("GIST_ID")
+    return token, gist_id
+
+
+def load_portfolio():
+    """
+    Load portfolio from GitHub Gist (primary) or local file (fallback).
+    Gist is always authoritative — local file never overrides it.
+    """
+    token, gist_id = _get_gist_credentials()
+
+    if token and gist_id:
+        try:
+            url = "https://api.github.com/gists/%s" % gist_id
+            req = urllib.request.Request(url, headers={
+                "Authorization": "token %s" % token,
+                "Accept":        "application/vnd.github.v3+json",
+                "User-Agent":    "PortfolioApp",
+            })
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            files = data.get("files", {})
+            for fname, fdata in files.items():
+                if fname.endswith(".json"):
+                    portfolio = json.loads(fdata.get("content", "{}"))
+                    if isinstance(portfolio.get("holdings"), list):
+                        return portfolio
+        except Exception:
+            pass
+        # Gist failed — return empty (never fall back to stale local)
+        return {"holdings": [], "cash": 0.0, "currency": "USD",
+                "last_updated": ""}
+
+    # Local mode (no Gist configured)
+    if not os.path.exists(DATA_PATH):
+        return {"holdings": [], "cash": 0.0, "currency": "USD"}
+    try:
         with open(DATA_PATH) as f:
             return json.load(f)
+    except Exception:
+        return {"holdings": [], "cash": 0.0, "currency": "USD"}
 
 
 def save_portfolio(data):
-    """Delegate to db.py persistence layer."""
-    try:
-        from db import save_portfolio as _save
-        _save(data)
-        return
-    except ImportError:
-        pass
-    # Fallback: local file
+    """
+    Save portfolio to GitHub Gist (primary) or local file (fallback).
+    In Gist mode: ONLY writes to Gist, never to local file.
+    """
+    from datetime import datetime, timezone
     clean = json.loads(json.dumps(data))
     for h in clean.get("holdings", []):
         for k in ("current_price", "prev_close", "change_pct"):
             h.pop(k, None)
-    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
-    with open(DATA_PATH, "w") as f:
-        json.dump(clean, f, indent=2)
+    clean["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    token, gist_id = _get_gist_credentials()
+
+    if token and gist_id:
+        try:
+            payload = json.dumps({
+                "files": {"portfolio.json": {"content": json.dumps(clean, indent=2)}}
+            }).encode()
+            url = "https://api.github.com/gists/%s" % gist_id
+            req = urllib.request.Request(url, data=payload, method="PATCH", headers={
+                "Authorization": "token %s" % token,
+                "Content-Type":  "application/json",
+                "Accept":        "application/vnd.github.v3+json",
+                "User-Agent":    "PortfolioApp",
+            })
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    # Local mode
+    try:
+        os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
+        with open(DATA_PATH, "w") as f:
+            json.dump(clean, f, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def fetch_prices(tickers):
