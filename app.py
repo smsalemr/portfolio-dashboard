@@ -1563,3 +1563,100 @@ with tabs[7]:
                 _save_and_refresh(restored)
                 st.success("✅ Portfolio imported — %d holdings loaded" % len(restored.get("holdings",[])))
                 st.rerun()
+
+    # ── JSON Backup / Restore ─────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>JSON Backup & Restore</div>", unsafe_allow_html=True)
+
+    jc1, jc2 = st.columns(2)
+
+    with jc1:
+        st.markdown("**Export full portfolio JSON**")
+        import json as _json
+        # Build clean export — includes holdings, cash, cash_seed, transactions
+        export_data = {
+            "holdings":     st.session_state.portfolio.get("holdings", []),
+            "cash":         st.session_state.portfolio.get("cash", 0),
+            "cash_seed":    st.session_state.portfolio.get("cash_seed", 0),
+            "currency":     st.session_state.portfolio.get("currency", "USD"),
+            "transactions": st.session_state.portfolio.get("transactions", []),
+            "last_updated": st.session_state.portfolio.get("last_updated", ""),
+            "backup_version": "1.0",
+            "backup_ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        }
+        # Integrity checksum
+        import hashlib
+        checksum = hashlib.md5(
+            _json.dumps(export_data, sort_keys=True).encode()
+        ).hexdigest()[:8]
+        export_data["checksum"] = checksum
+
+        json_str = _json.dumps(export_data, indent=2)
+        st.download_button(
+            label="⬇️ Download portfolio_backup.json",
+            data=json_str,
+            file_name="portfolio_backup_%s.json" % datetime.now(timezone.utc).strftime("%Y%m%d_%H%M"),
+            mime="application/json",
+        )
+        st.markdown(
+            "<div class='mono-sm' style='color:#475569;margin-top:4px;'>"
+            "Checksum: <b>%s</b> · %d holdings · %d transactions</div>" % (
+                checksum,
+                len(export_data["holdings"]),
+                len(export_data["transactions"]),
+            ), unsafe_allow_html=True,
+        )
+
+    with jc2:
+        st.markdown("**Restore from JSON backup**")
+        json_file = st.file_uploader(
+            "Upload portfolio_backup.json",
+            type=["json"],
+            key="json_restore",
+        )
+        if json_file:
+            try:
+                raw       = json_file.read().decode("utf-8")
+                imported  = _json.loads(raw)
+
+                # Verify integrity
+                stored_checksum = imported.pop("checksum", None)
+                import hashlib as _hl
+                calc_checksum = _hl.md5(
+                    _json.dumps(imported, sort_keys=True).encode()
+                ).hexdigest()[:8]
+
+                integrity_ok = (stored_checksum == calc_checksum) if stored_checksum else True
+                integrity_msg = "✅ Checksum verified" if integrity_ok else "⚠️ Checksum mismatch — file may be modified"
+                integrity_color = "#10B981" if integrity_ok else "#F59E0B"
+
+                st.markdown(
+                    "<div style='font-family:DM Mono,monospace;font-size:0.75rem;"
+                    "color:%s;padding:4px 0;'>%s</div>" % (integrity_color, integrity_msg),
+                    unsafe_allow_html=True,
+                )
+
+                # Show preview
+                n_holdings     = len(imported.get("holdings", []))
+                n_transactions = len(imported.get("transactions", []))
+                cash           = imported.get("cash", 0)
+                backup_ts      = imported.get("backup_ts", "unknown")
+
+                st.markdown(
+                    "<div class='mono-sm'>%d holdings · %d transactions<br>"
+                    "Cash: %s · Backed up: %s</div>" % (
+                        n_holdings, n_transactions,
+                        fmt_usd(cash, 0), backup_ts,
+                    ), unsafe_allow_html=True,
+                )
+
+                if st.button("🔄 Restore Portfolio"):
+                    # Remove backup metadata before saving
+                    imported.pop("backup_version", None)
+                    imported.pop("backup_ts", None)
+                    _save_and_refresh(imported)
+                    st.success("✅ Portfolio restored — %d holdings, %d transactions" % (
+                        n_holdings, n_transactions))
+                    st.rerun()
+
+            except Exception as e:
+                st.error("❌ Invalid backup file: %s" % str(e))
