@@ -1430,8 +1430,9 @@ with tabs[7]:
     col_cash, _ = st.columns([1, 2])
     with col_cash:
         _cash_val = float(port.get("cash", 0))
+        # No min_value — cash can be negative if transactions exceed seed
         new_cash = st.number_input(
-            "Cash (USD)", min_value=-999999999.0,
+            "Cash (USD)",
             value=_cash_val,
             step=1000.0, format="%.2f",
         )
