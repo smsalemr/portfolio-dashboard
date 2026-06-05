@@ -1205,16 +1205,31 @@ with tabs[6]:
                     unsafe_allow_html=True)
         st.info("No transactions yet. Import your current positions as opening transactions.")
         if st.button("📥 Import Current Holdings as BUY Transactions"):
-            updated = dict(port)
-
-            # Calculate cash_seed = current cash + total cost of all owned positions
+            # Read original holdings from current Gist state
             owned_positions = [h for h in port.get("holdings", [])
                                if h["status"] == "Owned" and float(h.get("shares", 0)) > 0]
+            watchlist       = [h for h in port.get("holdings", [])
+                               if h["status"] == "Watchlist"]
+
+            # Cash seed = current cash + total cost of all positions
             total_cost = sum(float(h["shares"]) * float(h["avg_buy"]) for h in owned_positions)
             cash_seed  = round(float(port.get("cash", 0)) + total_cost, 2)
-            updated["cash_seed"] = cash_seed
-            updated["transactions"] = []   # clear any previous
 
+            # Start completely fresh — zero out shares, clear transactions
+            clean_holdings = []
+            for h in owned_positions:
+                clean_holdings.append({**h, "shares": 0, "avg_buy": 0, "status": "Watchlist"})
+            clean_holdings += watchlist
+
+            updated = {
+                "holdings":     clean_holdings,
+                "cash":         cash_seed,
+                "cash_seed":    cash_seed,
+                "transactions": [],
+                "currency":     port.get("currency", "USD"),
+            }
+
+            # Replay each position as a BUY transaction
             for h in owned_positions:
                 txn = {
                     "type":   "BUY",
@@ -1232,7 +1247,7 @@ with tabs[6]:
             save_portfolio(updated)
             st.session_state.portfolio = updated
             refresh_computed()
-            st.success("✅ %d positions imported. Cash seed: %s — Cash remaining: %s" % (
+            st.success("✅ %d positions imported — Cash seed: %s · Cash remaining: %s" % (
                 len(owned_positions), fmt_usd(cash_seed, 0),
                 fmt_usd(updated.get("cash", 0), 0)))
             st.rerun()
