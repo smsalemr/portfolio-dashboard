@@ -1205,26 +1205,36 @@ with tabs[6]:
                     unsafe_allow_html=True)
         st.info("No transactions yet. Import your current positions as opening transactions.")
         if st.button("📥 Import Current Holdings as BUY Transactions"):
-            from datetime import date
             updated = dict(port)
-            for h in port.get("holdings", []):
-                if h["status"] == "Owned" and float(h.get("shares", 0)) > 0:
-                    txn = {
-                        "type":   "BUY",
-                        "ticker": h["ticker"],
-                        "shares": float(h["shares"]),
-                        "price":  float(h["avg_buy"]),
-                        "date":   "2025-01-01",
-                        "name":   h["name"],
-                        "notes":  "Imported from existing portfolio",
-                    }
-                    updated = add_transaction(updated, txn)
+
+            # Calculate cash_seed = current cash + total cost of all owned positions
+            owned_positions = [h for h in port.get("holdings", [])
+                               if h["status"] == "Owned" and float(h.get("shares", 0)) > 0]
+            total_cost = sum(float(h["shares"]) * float(h["avg_buy"]) for h in owned_positions)
+            cash_seed  = round(float(port.get("cash", 0)) + total_cost, 2)
+            updated["cash_seed"] = cash_seed
+            updated["transactions"] = []   # clear any previous
+
+            for h in owned_positions:
+                txn = {
+                    "type":   "BUY",
+                    "ticker": h["ticker"],
+                    "shares": float(h["shares"]),
+                    "price":  float(h["avg_buy"]),
+                    "date":   "2025-01-01",
+                    "name":   h["name"],
+                    "sector": h.get("sector", "Other"),
+                    "style":  h.get("style", "Growth"),
+                    "notes":  "Imported from existing portfolio",
+                }
+                updated = add_transaction(updated, txn)
+
             save_portfolio(updated)
             st.session_state.portfolio = updated
             refresh_computed()
-            st.success("✅ %d positions imported as transactions" %
-                       len([h for h in port.get("holdings",[])
-                            if h["status"]=="Owned" and float(h.get("shares",0))>0]))
+            st.success("✅ %d positions imported. Cash seed: %s — Cash remaining: %s" % (
+                len(owned_positions), fmt_usd(cash_seed, 0),
+                fmt_usd(updated.get("cash", 0), 0)))
             st.rerun()
 
     # ── Transaction History ───────────────────────────────────────────────────

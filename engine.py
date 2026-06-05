@@ -1130,6 +1130,10 @@ def add_transaction(data: dict, txn: dict) -> dict:
     """
     Add a transaction and update portfolio state.
 
+    Cash model:
+      cash_seed = total capital ever deposited (set once, never changes)
+      cash = cash_seed - sum(all BUY totals) + sum(all SELL proceeds)
+
     txn fields:
       type     : "BUY" | "SELL"
       ticker   : str
@@ -1137,9 +1141,6 @@ def add_transaction(data: dict, txn: dict) -> dict:
       price    : float  (price per share)
       date     : str    (YYYY-MM-DD)
       notes    : str    (optional)
-
-    For BUY:  deducts cash, updates holding avg_buy + shares
-    For SELL: adds cash, reduces holding shares, records realized P/L
     """
     import uuid
     from datetime import datetime, timezone
@@ -1153,30 +1154,42 @@ def add_transaction(data: dict, txn: dict) -> dict:
     txn["total"]  = round(txn["shares"] * txn["price"], 2)
 
     holdings = data.get("holdings", [])
-    cash     = float(data.get("cash", 0))
 
-    # Find existing holding
+    # ── Cash: always recalculate from seed ───────────────────────────────────
+    # cash_seed is set on first use and never modified by transactions
+    if "cash_seed" not in data:
+        # First time: seed = current cash + total of this transaction if BUY
+        data["cash_seed"] = round(float(data.get("cash", 0))
+                                  + (txn["total"] if txn["type"] == "BUY" else 0), 2)
+
+    all_txns    = data.get("transactions", [])
+    total_buys  = sum(float(t.get("total", 0)) for t in all_txns if t.get("type") == "BUY")
+    total_sells = sum(float(t.get("total", 0)) for t in all_txns if t.get("type") == "SELL")
+
+    if txn["type"] == "BUY":
+        total_buys += txn["total"]
+    else:
+        total_sells += txn["total"]
+
+    cash = round(float(data["cash_seed"]) - total_buys + total_sells, 2)
+
+    # ── Find existing holding ─────────────────────────────────────────────────
     h_idx = next((i for i, h in enumerate(holdings)
                   if h["ticker"] == txn["ticker"]), None)
 
     if txn["type"] == "BUY":
-        cost = txn["total"]
-        cash = round(cash - cost, 2)
-
         if h_idx is not None:
-            h = holdings[h_idx]
-            old_shares   = float(h.get("shares", 0))
-            old_avg      = float(h.get("avg_buy", 0))
-            new_shares   = old_shares + txn["shares"]
-            # Weighted average cost
-            new_avg      = round(
+            h          = holdings[h_idx]
+            old_shares = float(h.get("shares", 0))
+            old_avg    = float(h.get("avg_buy", 0))
+            new_shares = old_shares + txn["shares"]
+            new_avg    = round(
                 (old_shares * old_avg + txn["shares"] * txn["price"]) / new_shares, 4
             ) if new_shares > 0 else txn["price"]
             holdings[h_idx]["shares"]  = new_shares
             holdings[h_idx]["avg_buy"] = new_avg
             holdings[h_idx]["status"]  = "Owned"
         else:
-            # New holding
             holdings.append({
                 "ticker":       txn["ticker"],
                 "name":         txn.get("name", txn["ticker"]),
@@ -1188,36 +1201,30 @@ def add_transaction(data: dict, txn: dict) -> dict:
                 "target_entry": None,
                 "notes":        txn.get("notes", ""),
             })
-
         txn["realized_pl"] = None
-        txn["cash_after"]  = cash
 
     elif txn["type"] == "SELL":
         if h_idx is None:
-            return data   # no holding to sell — ignore
+            return data   # no holding — ignore
 
         h          = holdings[h_idx]
         avg_cost   = float(h.get("avg_buy", txn["price"]))
         realized   = round((txn["price"] - avg_cost) * txn["shares"], 2)
-        proceeds   = txn["total"]
-        cash       = round(cash + proceeds, 2)
-
         new_shares = float(h.get("shares", 0)) - txn["shares"]
+
         if new_shares <= 0:
-            # Fully sold — move to Watchlist
             holdings[h_idx]["shares"]  = 0
             holdings[h_idx]["avg_buy"] = 0
             holdings[h_idx]["status"]  = "Watchlist"
         else:
             holdings[h_idx]["shares"] = round(new_shares, 4)
-            # avg_buy stays the same on partial sell (FIFO not required)
 
         txn["realized_pl"] = realized
-        txn["cash_after"]  = cash
 
+    txn["cash_after"]    = cash
     data["holdings"]     = holdings
     data["cash"]         = cash
-    data["transactions"] = data.get("transactions", []) + [txn]
+    data["transactions"] = all_txns + [txn]
     return data
 
 
@@ -1230,40 +1237,70 @@ def delete_transaction(data: dict, txn_id: str) -> dict:
 def rebuild_portfolio_from_transactions(data: dict) -> dict:
     """
     Reconstruct holdings and cash from the full transaction log.
-    Useful after editing/deleting transactions.
-    Preserves cash_seed (initial cash before any transactions).
+    Uses cash_seed as the fixed starting capital.
+    Cash = cash_seed - total_buys + total_sells
     """
     txns      = sorted(data.get("transactions", []), key=lambda t: t.get("date", ""))
     cash_seed = float(data.get("cash_seed", data.get("cash", 0)))
 
-    # Start fresh
-    rebuild = {
-        "holdings":     [h for h in data.get("holdings", [])
-                         if h["status"] == "Watchlist"],   # keep watchlist
-        "cash":         cash_seed,
-        "cash_seed":    cash_seed,
-        "transactions": [],
-        "currency":     data.get("currency", "USD"),
-    }
+    # Calculate cash directly from seed + transactions
+    total_buys  = sum(float(t.get("total", 0)) for t in txns if t.get("type") == "BUY")
+    total_sells = sum(float(t.get("total", 0)) for t in txns if t.get("type") == "SELL")
+    final_cash  = round(cash_seed - total_buys + total_sells, 2)
 
-    # Replay all transactions
+    # Rebuild holdings from scratch
+    holdings_map = {}
+    # Preserve watchlist items
+    for h in data.get("holdings", []):
+        if h["status"] == "Watchlist":
+            holdings_map[h["ticker"]] = dict(h)
+
     for t in txns:
-        # Carry over metadata
-        t2 = {k: v for k, v in t.items() if k != "id"}
-        rebuild = add_transaction(rebuild, t2)
+        ticker = t["ticker"]
+        shares = float(t.get("shares", 0))
+        price  = float(t.get("price", 0))
+        total  = float(t.get("total", 0))
 
-    # Restore IDs
-    for i, t in enumerate(txns):
-        if i < len(rebuild.get("transactions", [])):
-            rebuild["transactions"][i]["id"] = t.get("id", rebuild["transactions"][i]["id"])
+        if t["type"] == "BUY":
+            if ticker in holdings_map and holdings_map[ticker].get("status") == "Owned":
+                h          = holdings_map[ticker]
+                old_s      = float(h.get("shares", 0))
+                old_a      = float(h.get("avg_buy", 0))
+                new_s      = old_s + shares
+                new_a      = round((old_s * old_a + shares * price) / new_s, 4) if new_s else price
+                holdings_map[ticker]["shares"]  = new_s
+                holdings_map[ticker]["avg_buy"] = new_a
+                holdings_map[ticker]["status"]  = "Owned"
+            else:
+                holdings_map[ticker] = {
+                    "ticker":       ticker,
+                    "name":         t.get("name", ticker),
+                    "sector":       t.get("sector", "Other"),
+                    "style":        t.get("style", "Growth"),
+                    "status":       "Owned",
+                    "shares":       shares,
+                    "avg_buy":      price,
+                    "target_entry": None,
+                    "notes":        t.get("notes", ""),
+                }
+        elif t["type"] == "SELL":
+            if ticker in holdings_map:
+                new_s = float(holdings_map[ticker].get("shares", 0)) - shares
+                if new_s <= 0:
+                    holdings_map[ticker]["shares"]  = 0
+                    holdings_map[ticker]["avg_buy"] = 0
+                    holdings_map[ticker]["status"]  = "Watchlist"
+                else:
+                    holdings_map[ticker]["shares"] = round(new_s, 4)
 
-    # Restore watchlist items with their original details
-    wl_map = {h["ticker"]: h for h in data.get("holdings", []) if h["status"] == "Watchlist"}
-    for i, h in enumerate(rebuild["holdings"]):
-        if h["ticker"] in wl_map:
-            rebuild["holdings"][i] = {**wl_map[h["ticker"]], **h}
-
-    return rebuild
+    return {
+        "holdings":     list(holdings_map.values()),
+        "cash":         final_cash,
+        "cash_seed":    cash_seed,
+        "transactions": txns,
+        "currency":     data.get("currency", "USD"),
+        "last_updated": data.get("last_updated", ""),
+    }
 
 
 def get_transaction_summary(transactions: list) -> dict:
