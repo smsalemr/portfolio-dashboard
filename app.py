@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from engine import (load_portfolio, save_portfolio,
                    fetch_prices, compute_portfolio,
                    fetch_analysis, compute_analysis, compute_allocation, compute_risk_report,
+                   get_transactions, add_transaction, delete_transaction,
+                   rebuild_portfolio_from_transactions, get_transaction_summary,
                    STYLE_ICONS, RATING_STYLES)
 
 # ── Inline helpers (formerly in db.py) ───────────────────────────────────────
@@ -380,7 +382,7 @@ with h3:
 st.markdown("<hr class='divider'>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💰 Allocation", "🛡️ Risk", "💡 Recs", "✏️ Update"])
+tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💰 Allocation", "🛡️ Risk", "📒 Ledger", "💡 Recs", "✏️ Update"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1123,9 +1125,199 @@ with tabs[5]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 7 — RECOMMENDATIONS
+# TAB 7 — TRANSACTION LEDGER  (Phase 6)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[6]:
+    port      = st.session_state.portfolio
+    txns      = get_transactions(port)
+    summary   = get_transaction_summary(txns)
+
+    # ── Summary KPIs ──────────────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Transaction Summary</div>", unsafe_allow_html=True)
+    lk1, lk2, lk3, lk4 = st.columns(4)
+    lk1.metric("Total Transactions", str(summary["total_transactions"]))
+    lk2.metric("Total Invested",     fmt_usd(summary["total_invested"], 0))
+    lk3.metric("Total Proceeds",     fmt_usd(summary["total_proceeds"], 0))
+    dc = "normal" if summary["realized_pl"] >= 0 else "inverse"
+    lk4.metric("Realized P/L",       fmt_usd(summary["realized_pl"]),
+               delta_color=dc)
+
+    # ── Add Transaction Form ──────────────────────────────────────────────────
+    st.markdown("<div class='sec-hdr'>Add Transaction</div>", unsafe_allow_html=True)
+
+    with st.expander("➕ Record Buy or Sell", expanded=len(txns)==0):
+        tf1, tf2 = st.columns(2)
+        txn_type   = tf1.selectbox("Type", ["BUY", "SELL"], key="txn_type")
+        txn_ticker = tf2.text_input("Ticker", placeholder="e.g. NVDA", key="txn_ticker").upper().strip()
+
+        tf3, tf4, tf5 = st.columns(3)
+        txn_shares = tf3.number_input("Shares", min_value=0.01, step=1.0,  format="%.2f", key="txn_shares")
+        txn_price  = tf4.number_input("Price per Share ($)", min_value=0.01, step=0.01, format="%.2f", key="txn_price")
+        txn_date   = tf5.date_input("Date", key="txn_date")
+
+        tf6, tf7 = st.columns(2)
+        txn_name   = tf6.text_input("Company Name (BUY only)", key="txn_name")
+        txn_notes  = tf7.text_input("Notes (optional)", key="txn_notes")
+
+        # Show computed total
+        if txn_shares > 0 and txn_price > 0:
+            total = round(txn_shares * txn_price, 2)
+            action_word = "Cost" if txn_type == "BUY" else "Proceeds"
+            color = "#EF4444" if txn_type == "BUY" else "#10B981"
+            st.markdown(
+                "<div style='font-family:DM Mono,monospace;font-size:0.9rem;"
+                "color:%s;padding:0.5rem 0;'>%s: %s</div>" % (color, action_word, fmt_usd(total)),
+                unsafe_allow_html=True,
+            )
+
+        if st.button("✅ Record Transaction", key="add_txn"):
+            if not txn_ticker:
+                st.error("Enter a ticker symbol.")
+            elif txn_shares <= 0 or txn_price <= 0:
+                st.error("Shares and price must be greater than 0.")
+            elif txn_type == "SELL" and not any(
+                h["ticker"] == txn_ticker and float(h.get("shares",0)) > 0
+                for h in port.get("holdings", [])
+            ):
+                st.error("%s not found in owned positions." % txn_ticker)
+            else:
+                new_txn = {
+                    "type":   txn_type,
+                    "ticker": txn_ticker,
+                    "shares": txn_shares,
+                    "price":  txn_price,
+                    "date":   str(txn_date),
+                    "name":   txn_name or txn_ticker,
+                    "notes":  txn_notes,
+                }
+                updated = add_transaction(dict(port), new_txn)
+                save_portfolio(updated)
+                st.session_state.portfolio = updated
+                refresh_computed()
+                action = "Bought" if txn_type == "BUY" else "Sold"
+                st.success("✅ %s %s shares of %s @ %s" % (
+                    action, txn_shares, txn_ticker, fmt_usd(txn_price)))
+                st.rerun()
+
+    # ── Initialize existing holdings as transactions ───────────────────────────
+    if not txns:
+        st.markdown("<div class='sec-hdr'>Initialize from Current Holdings</div>",
+                    unsafe_allow_html=True)
+        st.info("No transactions yet. Import your current positions as opening transactions.")
+        if st.button("📥 Import Current Holdings as BUY Transactions"):
+            from datetime import date
+            updated = dict(port)
+            for h in port.get("holdings", []):
+                if h["status"] == "Owned" and float(h.get("shares", 0)) > 0:
+                    txn = {
+                        "type":   "BUY",
+                        "ticker": h["ticker"],
+                        "shares": float(h["shares"]),
+                        "price":  float(h["avg_buy"]),
+                        "date":   "2025-01-01",
+                        "name":   h["name"],
+                        "notes":  "Imported from existing portfolio",
+                    }
+                    updated = add_transaction(updated, txn)
+            save_portfolio(updated)
+            st.session_state.portfolio = updated
+            refresh_computed()
+            st.success("✅ %d positions imported as transactions" %
+                       len([h for h in port.get("holdings",[])
+                            if h["status"]=="Owned" and float(h.get("shares",0))>0]))
+            st.rerun()
+
+    # ── Transaction History ───────────────────────────────────────────────────
+    if txns:
+        st.markdown("<div class='sec-hdr'>Transaction History</div>", unsafe_allow_html=True)
+
+        # Sort newest first
+        sorted_txns = sorted(txns, key=lambda t: t.get("date",""), reverse=True)
+
+        for t in sorted_txns:
+            is_buy     = t.get("type") == "BUY"
+            type_color = "#10B981" if is_buy else "#EF4444"
+            type_icon  = "🟢" if is_buy else "🔴"
+            pl         = t.get("realized_pl")
+            pl_str     = ""
+            if pl is not None:
+                pl_color = "#10B981" if pl >= 0 else "#EF4444"
+                pl_str   = ("<span style='color:%s;font-size:0.8rem;'>P/L: %s</span>"
+                            % (pl_color, fmt_usd(pl)))
+
+            st.markdown(
+                "<div class='card' style='padding:0.7rem 1.1rem;"
+                "border-left:4px solid %s;margin-bottom:0.35rem;'>"
+                "<div style='display:flex;justify-content:space-between;"
+                "align-items:center;flex-wrap:wrap;gap:0.5rem;'>"
+                "<div>"
+                "<span style='font-family:DM Serif Display,serif;font-size:1.1rem;"
+                "color:#F1F5F9;'>%s %s %s</span><br>"
+                "<span class='mono-sm'>%s &nbsp;·&nbsp; %s shares @ %s &nbsp;·&nbsp; %s</span>"
+                "</div>"
+                "<div style='text-align:right;'>"
+                "<div style='font-family:DM Mono,monospace;font-size:1rem;"
+                "color:%s;'>%s %s</div>"
+                "%s"
+                "</div>"
+                "</div></div>" % (
+                    type_color,
+                    type_icon, t.get("type",""), t.get("ticker",""),
+                    t.get("date",""), t.get("shares",""), fmt_usd(t.get("price",0)),
+                    t.get("notes","") or "",
+                    type_color,
+                    "+" if is_buy else "-",
+                    fmt_usd(t.get("total",0), 0),
+                    pl_str,
+                ),
+                unsafe_allow_html=True,
+            )
+
+            # Delete button
+            if st.button("🗑️", key="del_txn_%s" % t.get("id","")):
+                updated = delete_transaction(dict(port), t.get("id",""))
+                updated = rebuild_portfolio_from_transactions(updated)
+                save_portfolio(updated)
+                st.session_state.portfolio = updated
+                refresh_computed()
+                st.success("Transaction deleted and portfolio rebuilt.")
+                st.rerun()
+
+        # ── Per-ticker realized P/L table ─────────────────────────────────────
+        st.markdown("<div class='sec-hdr'>Realized P/L by Stock</div>",
+                    unsafe_allow_html=True)
+        per_tk = summary.get("per_ticker", {})
+        if per_tk:
+            for ticker, stats in sorted(per_tk.items()):
+                rpl = stats["realized_pl"]
+                if stats["sells"] == 0:
+                    continue
+                color = "#10B981" if rpl >= 0 else "#EF4444"
+                st.markdown(
+                    "<div class='card' style='padding:0.6rem 1rem;"
+                    "margin-bottom:0.3rem;'>"
+                    "<div style='display:flex;justify-content:space-between;'>"
+                    "<span style='font-family:DM Serif Display,serif;"
+                    "font-size:1rem;color:#F1F5F9;'>%s</span>"
+                    "<span style='font-family:DM Mono,monospace;font-size:0.9rem;"
+                    "color:%s;'>%s</span>"
+                    "</div>"
+                    "<span class='mono-sm'>Bought: %s  ·  Sold: %s</span>"
+                    "</div>" % (
+                        ticker,
+                        color, fmt_usd(rpl),
+                        fmt_usd(stats["buys"],0), fmt_usd(stats["sells"],0),
+                    ),
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("No completed (sold) positions yet.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 8 — RECOMMENDATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[7]:
     if not d["recommendations"]:
         st.success("✅ No immediate actions required.")
     else:

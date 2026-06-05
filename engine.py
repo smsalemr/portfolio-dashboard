@@ -1115,3 +1115,187 @@ def compute_risk_report(data, live_prices=None):
         "grand_total":        grand,
         "cash_pct":           round(cash / grand * 100, 1),
     }
+
+
+# ---------------------------------------------------------------------------
+# TRANSACTION LEDGER ENGINE  (Phase 6)
+# ---------------------------------------------------------------------------
+
+def get_transactions(gist_data: dict) -> list:
+    """Return transaction list from portfolio data. Always a list."""
+    return gist_data.get("transactions", [])
+
+
+def add_transaction(data: dict, txn: dict) -> dict:
+    """
+    Add a transaction and update portfolio state.
+
+    txn fields:
+      type     : "BUY" | "SELL"
+      ticker   : str
+      shares   : float
+      price    : float  (price per share)
+      date     : str    (YYYY-MM-DD)
+      notes    : str    (optional)
+
+    For BUY:  deducts cash, updates holding avg_buy + shares
+    For SELL: adds cash, reduces holding shares, records realized P/L
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    txn = dict(txn)
+    txn["id"]     = str(uuid.uuid4())[:8]
+    txn["ts"]     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    txn["ticker"] = txn["ticker"].strip().upper()
+    txn["shares"] = float(txn["shares"])
+    txn["price"]  = float(txn["price"])
+    txn["total"]  = round(txn["shares"] * txn["price"], 2)
+
+    holdings = data.get("holdings", [])
+    cash     = float(data.get("cash", 0))
+
+    # Find existing holding
+    h_idx = next((i for i, h in enumerate(holdings)
+                  if h["ticker"] == txn["ticker"]), None)
+
+    if txn["type"] == "BUY":
+        cost = txn["total"]
+        cash = round(cash - cost, 2)
+
+        if h_idx is not None:
+            h = holdings[h_idx]
+            old_shares   = float(h.get("shares", 0))
+            old_avg      = float(h.get("avg_buy", 0))
+            new_shares   = old_shares + txn["shares"]
+            # Weighted average cost
+            new_avg      = round(
+                (old_shares * old_avg + txn["shares"] * txn["price"]) / new_shares, 4
+            ) if new_shares > 0 else txn["price"]
+            holdings[h_idx]["shares"]  = new_shares
+            holdings[h_idx]["avg_buy"] = new_avg
+            holdings[h_idx]["status"]  = "Owned"
+        else:
+            # New holding
+            holdings.append({
+                "ticker":       txn["ticker"],
+                "name":         txn.get("name", txn["ticker"]),
+                "sector":       txn.get("sector", "Other"),
+                "style":        txn.get("style", "Growth"),
+                "status":       "Owned",
+                "shares":       txn["shares"],
+                "avg_buy":      txn["price"],
+                "target_entry": None,
+                "notes":        txn.get("notes", ""),
+            })
+
+        txn["realized_pl"] = None
+        txn["cash_after"]  = cash
+
+    elif txn["type"] == "SELL":
+        if h_idx is None:
+            return data   # no holding to sell — ignore
+
+        h          = holdings[h_idx]
+        avg_cost   = float(h.get("avg_buy", txn["price"]))
+        realized   = round((txn["price"] - avg_cost) * txn["shares"], 2)
+        proceeds   = txn["total"]
+        cash       = round(cash + proceeds, 2)
+
+        new_shares = float(h.get("shares", 0)) - txn["shares"]
+        if new_shares <= 0:
+            # Fully sold — move to Watchlist
+            holdings[h_idx]["shares"]  = 0
+            holdings[h_idx]["avg_buy"] = 0
+            holdings[h_idx]["status"]  = "Watchlist"
+        else:
+            holdings[h_idx]["shares"] = round(new_shares, 4)
+            # avg_buy stays the same on partial sell (FIFO not required)
+
+        txn["realized_pl"] = realized
+        txn["cash_after"]  = cash
+
+    data["holdings"]     = holdings
+    data["cash"]         = cash
+    data["transactions"] = data.get("transactions", []) + [txn]
+    return data
+
+
+def delete_transaction(data: dict, txn_id: str) -> dict:
+    """Remove a transaction by ID. Does NOT recalculate holdings — use rebuild instead."""
+    data["transactions"] = [t for t in data.get("transactions", []) if t.get("id") != txn_id]
+    return data
+
+
+def rebuild_portfolio_from_transactions(data: dict) -> dict:
+    """
+    Reconstruct holdings and cash from the full transaction log.
+    Useful after editing/deleting transactions.
+    Preserves cash_seed (initial cash before any transactions).
+    """
+    txns      = sorted(data.get("transactions", []), key=lambda t: t.get("date", ""))
+    cash_seed = float(data.get("cash_seed", data.get("cash", 0)))
+
+    # Start fresh
+    rebuild = {
+        "holdings":     [h for h in data.get("holdings", [])
+                         if h["status"] == "Watchlist"],   # keep watchlist
+        "cash":         cash_seed,
+        "cash_seed":    cash_seed,
+        "transactions": [],
+        "currency":     data.get("currency", "USD"),
+    }
+
+    # Replay all transactions
+    for t in txns:
+        # Carry over metadata
+        t2 = {k: v for k, v in t.items() if k != "id"}
+        rebuild = add_transaction(rebuild, t2)
+
+    # Restore IDs
+    for i, t in enumerate(txns):
+        if i < len(rebuild.get("transactions", [])):
+            rebuild["transactions"][i]["id"] = t.get("id", rebuild["transactions"][i]["id"])
+
+    # Restore watchlist items with their original details
+    wl_map = {h["ticker"]: h for h in data.get("holdings", []) if h["status"] == "Watchlist"}
+    for i, h in enumerate(rebuild["holdings"]):
+        if h["ticker"] in wl_map:
+            rebuild["holdings"][i] = {**wl_map[h["ticker"]], **h}
+
+    return rebuild
+
+
+def get_transaction_summary(transactions: list) -> dict:
+    """Portfolio-level transaction statistics."""
+    buys  = [t for t in transactions if t.get("type") == "BUY"]
+    sells = [t for t in transactions if t.get("type") == "SELL"]
+
+    total_invested  = sum(t.get("total", 0) for t in buys)
+    total_proceeds  = sum(t.get("total", 0) for t in sells)
+    realized_pl     = sum(t.get("realized_pl", 0) or 0 for t in sells)
+
+    # Per-ticker summary
+    tickers = {}
+    for t in transactions:
+        tk = t.get("ticker", "")
+        if tk not in tickers:
+            tickers[tk] = {"buys": 0, "sells": 0, "realized_pl": 0,
+                           "shares_bought": 0, "shares_sold": 0}
+        if t["type"] == "BUY":
+            tickers[tk]["buys"]         += t.get("total", 0)
+            tickers[tk]["shares_bought"]+= t.get("shares", 0)
+        else:
+            tickers[tk]["sells"]        += t.get("total", 0)
+            tickers[tk]["shares_sold"]  += t.get("shares", 0)
+            tickers[tk]["realized_pl"]  += t.get("realized_pl", 0) or 0
+
+    return {
+        "total_transactions": len(transactions),
+        "total_buys":         len(buys),
+        "total_sells":        len(sells),
+        "total_invested":     round(total_invested, 2),
+        "total_proceeds":     round(total_proceeds, 2),
+        "realized_pl":        round(realized_pl, 2),
+        "per_ticker":         tickers,
+    }
