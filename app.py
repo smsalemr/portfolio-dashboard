@@ -1404,9 +1404,10 @@ with tabs[7]:
     st.markdown("<div class='sec-hdr'>Cash Balance</div>", unsafe_allow_html=True)
     col_cash, _ = st.columns([1, 2])
     with col_cash:
+        _cash_val = float(port.get("cash", 0))
         new_cash = st.number_input(
-            "Cash (USD)", min_value=0.0,
-            value=float(port.get("cash", 0)),
+            "Cash (USD)", min_value=-999999999.0,
+            value=_cash_val,
             step=1000.0, format="%.2f",
         )
         if st.button("💾 Save Cash"):
