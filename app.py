@@ -20,6 +20,7 @@ from engine import (load_portfolio, save_portfolio,
                    fetch_analysis, compute_analysis, compute_allocation, compute_risk_report,
                    get_transactions, add_transaction, delete_transaction,
                    rebuild_portfolio_from_transactions, get_transaction_summary,
+                   parse_baraka_pdf, apply_baraka_import,
                    STYLE_ICONS, RATING_STYLES)
 
 # ── Inline helpers (formerly in db.py) ───────────────────────────────────────
@@ -382,7 +383,7 @@ with h3:
 st.markdown("<hr class='divider'>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💰 Allocation", "🛡️ Risk", "📒 Ledger", "💡 Recs", "✏️ Update"])
+tabs = st.tabs(["📊 Overview", "📈 Holdings", "🔭 Watchlist", "🔬 Analysis", "💰 Allocation", "🛡️ Risk", "📒 Ledger", "📂 Import", "💡 Recs", "✏️ Update"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1340,9 +1341,183 @@ with tabs[6]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 8 — RECOMMENDATIONS
+# TAB 8 — BROKER IMPORT  (Phase 8)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[7]:
+    st.markdown("<div class='sec-hdr'>Import Baraka Statement</div>", unsafe_allow_html=True)
+
+    # Instructions
+    st.markdown(
+        "<div class='alert-info' style='margin-bottom:1rem;'>"
+        "ℹ️ Upload your <b>Baraka monthly PDF statement</b>. "
+        "The system will automatically extract all BUY and SELL transactions, "
+        "skip duplicates, and update your portfolio.<br><br>"
+        "<b>How to get your statement:</b> Baraka app → Account → "
+        "Statements → Download PDF</div>",
+        unsafe_allow_html=True,
+    )
+
+    uploaded_pdf = st.file_uploader(
+        "Upload Baraka Account Statement (PDF)",
+        type=["pdf"],
+        key="baraka_pdf_upload",
+    )
+
+    if uploaded_pdf:
+        pdf_bytes = uploaded_pdf.read()
+        st.markdown(
+            "<div class='mono-sm' style='color:#475569;margin-bottom:0.5rem;'>"
+            "📄 %s (%d KB)</div>" % (uploaded_pdf.name, len(pdf_bytes) // 1024),
+            unsafe_allow_html=True,
+        )
+
+        with st.spinner("Parsing PDF…"):
+            parsed = parse_baraka_pdf(pdf_bytes)
+
+        # Show parse results
+        n_txns     = len(parsed["transactions"])
+        n_deposits = len(parsed["deposits"])
+        period     = parsed.get("period", "Unknown period")
+        errors     = parsed.get("errors", [])
+
+        if errors:
+            for e in errors:
+                st.warning("⚠️ %s" % e)
+
+        if n_txns == 0 and n_deposits == 0:
+            st.error("❌ No transactions found. Make sure this is a Baraka/DriveWealth statement.")
+        else:
+            st.markdown(
+                "<div class='card' style='border-left:4px solid #3B82F6;"
+                "margin-bottom:1rem;'>"
+                "<div style='font-family:DM Serif Display,serif;font-size:1.1rem;"
+                "color:#F1F5F9;margin-bottom:0.5rem;'>Preview — %s</div>"
+                "<div style='display:flex;gap:2rem;flex-wrap:wrap;'>"
+                "<div><div class='mono-sm'>Transactions Found</div>"
+                "<div class='mono-val'>%d</div></div>"
+                "<div><div class='mono-sm'>Deposits Found</div>"
+                "<div class='mono-val'>%d</div></div>"
+                "<div><div class='mono-sm'>Total Deposited</div>"
+                "<div class='mono-val'>%s</div></div>"
+                "</div></div>" % (
+                    period, n_txns, n_deposits,
+                    fmt_usd(parsed.get("total_deposited", 0), 2)
+                ),
+                unsafe_allow_html=True,
+            )
+
+            # Preview transactions
+            if parsed["transactions"]:
+                st.markdown("<div class='sec-hdr'>Transactions Preview</div>",
+                            unsafe_allow_html=True)
+                buys  = [t for t in parsed["transactions"] if t["type"] == "BUY"]
+                sells = [t for t in parsed["transactions"] if t["type"] == "SELL"]
+
+                for t in parsed["transactions"][:10]:
+                    is_buy = t["type"] == "BUY"
+                    color  = "#10B981" if is_buy else "#EF4444"
+                    icon   = "🟢" if is_buy else "🔴"
+                    st.markdown(
+                        "<div style='padding:5px 0;border-bottom:1px solid #1E2433;"
+                        "display:flex;justify-content:space-between;'>"
+                        "<span class='mono-sm'>%s <b>%s %s</b> · %s shares @ %s · %s</span>"
+                        "<span style='font-family:DM Mono,monospace;font-size:0.8rem;"
+                        "color:%s;'>%s %s</span>"
+                        "</div>" % (
+                            icon, t["type"], t["ticker"],
+                            t["shares"], fmt_usd(t["price"]), t["date"],
+                            color, "+" if is_buy else "-", fmt_usd(t["total"], 0),
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                if len(parsed["transactions"]) > 10:
+                    st.markdown(
+                        "<div class='mono-sm' style='color:#475569;padding-top:4px;'>"
+                        "... and %d more transactions</div>" % (len(parsed["transactions"]) - 10),
+                        unsafe_allow_html=True,
+                    )
+
+            # Import button
+            st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
+            col_imp, col_info = st.columns([1, 2])
+            with col_imp:
+                if st.button("📥 Import All Transactions", key="do_baraka_import"):
+                    with st.spinner("Importing…"):
+                        updated_port, summary = apply_baraka_import(
+                            dict(st.session_state.portfolio),
+                            parsed,
+                        )
+                    save_portfolio(updated_port)
+                    st.session_state.portfolio = updated_port
+                    refresh_computed()
+
+                    msg_parts = ["✅ Import complete"]
+                    msg_parts.append("%d transactions imported" % summary["imported"])
+                    if summary["skipped"] > 0:
+                        msg_parts.append("%d duplicates skipped" % summary["skipped"])
+                    if summary["deposits"] > 0:
+                        msg_parts.append("Deposits: %s" % fmt_usd(summary["deposits"], 2))
+                    if summary["errors"]:
+                        for e in summary["errors"]:
+                            st.warning("⚠️ %s" % e)
+
+                    st.success(" · ".join(msg_parts))
+                    st.rerun()
+
+            with col_info:
+                existing_txns = get_transactions(st.session_state.portfolio)
+                baraka_txns   = [t for t in existing_txns if t.get("source") == "baraka_pdf"]
+                st.markdown(
+                    "<div class='mono-sm' style='padding-top:8px;'>"
+                    "Previously imported from Baraka: <b>%d transactions</b></div>" % len(baraka_txns),
+                    unsafe_allow_html=True,
+                )
+
+    # ── Import history ────────────────────────────────────────────────────────
+    existing_txns = get_transactions(st.session_state.portfolio)
+    baraka_txns   = [t for t in existing_txns if t.get("source") == "baraka_pdf"]
+
+    if baraka_txns:
+        st.markdown("<div class='sec-hdr'>Previously Imported from Baraka</div>",
+                    unsafe_allow_html=True)
+        st.markdown(
+            "<div class='mono-sm' style='color:#475569;margin-bottom:0.5rem;'>"
+            "%d transactions imported · %d BUY · %d SELL</div>" % (
+                len(baraka_txns),
+                sum(1 for t in baraka_txns if t["type"]=="BUY"),
+                sum(1 for t in baraka_txns if t["type"]=="SELL"),
+            ),
+            unsafe_allow_html=True,
+        )
+
+        # Group by ticker
+        from collections import defaultdict
+        by_ticker = defaultdict(list)
+        for t in baraka_txns:
+            by_ticker[t["ticker"]].append(t)
+
+        for ticker, txns in sorted(by_ticker.items()):
+            total_bought = sum(t["total"] for t in txns if t["type"]=="BUY")
+            total_sold   = sum(t["total"] for t in txns if t["type"]=="SELL")
+            st.markdown(
+                "<div class='card' style='padding:0.6rem 1rem;margin-bottom:0.3rem;'>"
+                "<div style='display:flex;justify-content:space-between;'>"
+                "<span style='font-family:DM Serif Display,serif;color:#F1F5F9;'>"
+                "%s <span class='mono-sm'>(%d txns)</span></span>"
+                "<span class='mono-sm'>Bought: %s  Sold: %s</span>"
+                "</div></div>" % (
+                    ticker, len(txns),
+                    fmt_usd(total_bought, 0),
+                    fmt_usd(total_sold, 0) if total_sold else "—",
+                ),
+                unsafe_allow_html=True,
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 9 — RECOMMENDATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[8]:
     if not d["recommendations"]:
         st.success("✅ No immediate actions required.")
     else:
@@ -1392,9 +1567,9 @@ with tabs[7]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 9 — UPDATE PORTFOLIO  (persistent via db.py)
+# TAB 10 — UPDATE PORTFOLIO
 # ══════════════════════════════════════════════════════════════════════════════
-with tabs[8]:
+with tabs[9]:
 
     def _save_and_refresh(updated_portfolio):
         """Save to db, update session state, recompute."""

@@ -1336,3 +1336,228 @@ def get_transaction_summary(transactions: list) -> dict:
         "realized_pl":        round(realized_pl, 2),
         "per_ticker":         tickers,
     }
+
+
+# ---------------------------------------------------------------------------
+# BARAKA / DRIVEWEALTH PDF STATEMENT PARSER  (Phase 8)
+# ---------------------------------------------------------------------------
+
+def parse_baraka_pdf(pdf_bytes: bytes) -> dict:
+    """
+    Parse a Baraka/DriveWealth PDF account statement.
+
+    Extracts:
+      - transactions : list of {type, ticker, shares, price, total, date, notes}
+      - deposits     : list of {date, amount, description}
+      - total_deposited : float
+      - period       : str
+      - errors       : list of str
+
+    Uses pdfplumber for text extraction.
+    Never raises — all errors go to result["errors"].
+    """
+    result = {
+        "transactions":    [],
+        "deposits":        [],
+        "total_deposited": 0.0,
+        "period":          "",
+        "errors":          [],
+        "raw_rows":        [],
+    }
+
+    try:
+        import pdfplumber, re, io
+    except ImportError:
+        result["errors"].append("pdfplumber not installed — add to requirements.txt")
+        return result
+
+    try:
+        pdf_file = io.BytesIO(pdf_bytes)
+        with pdfplumber.open(pdf_file) as pdf:
+            full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+        # ── Extract period from header ────────────────────────────────────────
+        period_match = re.search(
+            r'(January|February|March|April|May|June|July|August|September|October|November|December)'
+            r'\s+\d{1,2},\s+\d{4}\s*[-–]\s*'
+            r'(January|February|March|April|May|June|July|August|September|October|November|December)'
+            r'\s+\d{1,2},\s+\d{4}',
+            full_text
+        )
+        if period_match:
+            result["period"] = period_match.group(0).strip()
+
+        # ── Find ACTIVITY section ─────────────────────────────────────────────
+        # Pattern: date  date  USD  TYPE  description  qty  price  amount
+        activity_pattern = re.compile(
+            r'(\d{2}/\d{2}/\d{4})\s+'          # trade date
+            r'\d{2}/\d{2}/\d{4}\s+'             # settle date
+            r'USD\s+'                            # currency
+            r'(BUY|SELL|JNLC|DIV|INT)\s+'       # activity type
+            r'(.+?)\s+'                          # description
+            r'(-?[\d,]+\.?\d*)\s+'              # quantity
+            r'([\d,]+\.?\d*)\s+'                # price
+            r'\(?([\d,]+\.?\d*)\)?',            # amount
+            re.MULTILINE
+        )
+
+        # Also catch JNLC deposits (no qty/price)
+        jnlc_pattern = re.compile(
+            r'(\d{2}/\d{2}/\d{4})\s+'
+            r'\d{2}/\d{2}/\d{4}\s+'
+            r'USD\s+JNLC\s+'
+            r'(.+?)\s+'
+            r'([\d,]+\.?\d*)\s*$',
+            re.MULTILINE
+        )
+
+        seen_keys = set()   # duplicate protection
+
+        # Process BUY/SELL rows
+        for m in activity_pattern.finditer(full_text):
+            trade_date   = m.group(1)   # MM/DD/YYYY
+            act_type     = m.group(2)
+            description  = m.group(3).strip()
+            qty_str      = m.group(4).replace(",", "")
+            price_str    = m.group(5).replace(",", "")
+            amount_str   = m.group(6).replace(",", "")
+
+            # Skip Bank Sweep (DWBDS)
+            if "DWBDS" in description or "Bank Sweep" in description:
+                continue
+
+            # Extract ticker from description
+            # Format: "TSLA - TESLA INC COM - TRD TSLA B 15 at 373.73"
+            ticker_match = re.match(r'^([A-Z]{1,5})\s*[-–]', description)
+            if not ticker_match:
+                result["errors"].append("Could not extract ticker from: %s" % description)
+                continue
+
+            ticker = ticker_match.group(1).strip()
+            name   = description.split("-")[1].strip() if "-" in description else ticker
+
+            # Clean up name: remove " COM" and trailing noise
+            name = re.sub(r'\s+(COM|INC|CORP|ETF|ADR)\b.*', '', name, flags=re.IGNORECASE).strip()
+            name = re.sub(r'\s+TRD\s+.*', '', name).strip()
+
+            try:
+                qty    = abs(float(qty_str))
+                price  = float(price_str)
+                total  = round(qty * price, 2)
+            except ValueError:
+                result["errors"].append("Could not parse numbers for %s" % ticker)
+                continue
+
+            # Convert date MM/DD/YYYY → YYYY-MM-DD
+            try:
+                parts    = trade_date.split("/")
+                iso_date = "%s-%s-%s" % (parts[2], parts[0], parts[1])
+            except Exception:
+                iso_date = trade_date
+
+            # Duplicate key: ticker + date + qty + price
+            dedup_key = "%s_%s_%s_%s_%s" % (act_type, ticker, iso_date, qty_str, price_str)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+
+            txn = {
+                "type":   act_type,          # "BUY" or "SELL"
+                "ticker": ticker,
+                "name":   name,
+                "shares": qty,
+                "price":  price,
+                "total":  total,
+                "date":   iso_date,
+                "notes":  "Imported from Baraka statement",
+                "source": "baraka_pdf",
+            }
+            result["transactions"].append(txn)
+
+        # Process JNLC deposits
+        for m in jnlc_pattern.finditer(full_text):
+            trade_date  = m.group(1)
+            description = m.group(2).strip()
+            amount_str  = m.group(3).replace(",", "")
+            try:
+                amount = float(amount_str)
+            except ValueError:
+                continue
+            try:
+                parts    = trade_date.split("/")
+                iso_date = "%s-%s-%s" % (parts[2], parts[0], parts[1])
+            except Exception:
+                iso_date = trade_date
+
+            dedup_key = "JNLC_%s_%s" % (iso_date, amount_str)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+
+            result["deposits"].append({
+                "date":        iso_date,
+                "amount":      amount,
+                "description": description,
+            })
+            result["total_deposited"] += amount
+
+        result["total_deposited"] = round(result["total_deposited"], 2)
+
+    except Exception as e:
+        result["errors"].append("PDF parsing error: %s" % str(e))
+
+    return result
+
+
+def apply_baraka_import(portfolio: dict, parsed: dict,
+                         existing_txn_ids: set = None) -> dict:
+    """
+    Apply parsed Baraka transactions to portfolio.
+    Deduplicates against existing transactions.
+    Returns updated portfolio + import summary.
+    """
+    existing_ids = existing_txn_ids or set()
+    existing_txns = portfolio.get("transactions", [])
+
+    # Build dedup set from existing transactions
+    existing_keys = set()
+    for t in existing_txns:
+        k = "%s_%s_%s_%s" % (
+            t.get("type",""), t.get("ticker",""),
+            t.get("date",""), t.get("shares","")
+        )
+        existing_keys.add(k)
+
+    imported = 0
+    skipped  = 0
+    errors   = list(parsed.get("errors", []))
+
+    for txn in parsed.get("transactions", []):
+        dedup_key = "%s_%s_%s_%s" % (
+            txn["type"], txn["ticker"], txn["date"], txn["shares"]
+        )
+        if dedup_key in existing_keys:
+            skipped += 1
+            continue
+
+        try:
+            portfolio = add_transaction(portfolio, txn)
+            existing_keys.add(dedup_key)
+            imported += 1
+        except Exception as e:
+            errors.append("Failed to import %s %s: %s" % (txn["type"], txn["ticker"], e))
+            skipped += 1
+
+    # Update cash_seed if deposits found
+    deposits = parsed.get("total_deposited", 0)
+    if deposits > 0:
+        current_seed = float(portfolio.get("cash_seed", portfolio.get("cash", 0)))
+        portfolio["cash_seed"] = round(current_seed + deposits, 2)
+
+    return portfolio, {
+        "imported": imported,
+        "skipped":  skipped,
+        "deposits": deposits,
+        "errors":   errors,
+        "period":   parsed.get("period", ""),
+    }
