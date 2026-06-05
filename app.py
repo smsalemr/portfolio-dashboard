@@ -1392,9 +1392,9 @@ with tabs[7]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 8 — UPDATE PORTFOLIO  (persistent via db.py)
+# TAB 9 — UPDATE PORTFOLIO  (persistent via db.py)
 # ══════════════════════════════════════════════════════════════════════════════
-with tabs[7]:
+with tabs[8]:
 
     def _save_and_refresh(updated_portfolio):
         """Save to db, update session state, recompute."""
